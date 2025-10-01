@@ -1,0 +1,19 @@
+.related-content-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1em;
+  margin: 1em 0;
+}
+.related-content-item {
+  flex: 1 1 30%;
+  min-width: 250px;
+  max-width: 33%;
+  box-sizing: border-box;
+}
+@media (max-width: 800px) {
+  .related-content-item {
+    min-width: 100%;
+    max-width: 100%;
+    flex-basis: 100%;
+  }
+}

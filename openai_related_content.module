@@ -1,0 +1,160 @@
+<?php
+
+function openai_related_content_block_info() {
+  return [
+    'openai_related_content_block' => [
+      'info' => t('OpenAI Related Content'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function openai_related_content_block_view($delta = '') {
+  if ($delta !== 'openai_related_content_block') return;
+
+  // Only display on canonical node/% pages.
+  if (arg(0) !== 'node' || !is_numeric(arg(1)) || !empty(arg(2))) return;
+
+  $node = menu_get_object('node');
+  if (!$node || !is_numeric($node->nid)) return;
+
+  $cache_key = 'openai_related_content:' . $node->nid;
+  $cached = cache_get($cache_key, 'cache');
+
+  if ($cached && isset($cached->data['output'])) {
+    $output = $cached->data['output'];
+  } else {
+    $related = openai_related_content_get_related_matches($node, 3);
+
+    if (empty($related)) {
+      $output = t('No related content found.');
+    } else {
+      $output = '<div class="related-content-grid">';
+      foreach ($related as $match) {
+        $nid = $match['nid'];
+        $related_node = node_load($nid);
+        if (!$related_node || !$related_node->status) continue;
+
+        // Get the node view but disable links for teasers
+        $view = node_view($related_node, 'teaser');
+        // Remove links that should not be shown
+        if (isset($view['links'])) {
+          unset($view['links']['node']['#links']['node-delete']);
+          unset($view['links']['node']['#links']['node-edit']);
+        }
+        $teaser = !empty($view) ? render($view) : '';
+        $output .= '<div class="related-content-item">' . $teaser . '</div>';
+      }
+      $output .= '</div>';
+    }
+
+    // Cache for 1 week (604800 seconds)
+    cache_set($cache_key, ['output' => $output], 'cache', REQUEST_TIME + 604800);
+  }
+
+  return [
+    'subject' => t('Related Content'),
+    'content' => [
+      '#markup' => $output,
+      '#attached' => [
+        'css' => [backdrop_get_path('module', 'openai_related_content') . '/openai_related_content.css'],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Fetch related matches (nid + title) for a given node.
+ *
+ * @param object $node
+ *   The current node object.
+ * @param int $limit
+ *   Number of related items.
+ * @return array
+ *   Array of ['nid' => ..., 'title' => ...]
+ */
+function openai_related_content_get_related_matches($node, $limit = 3) {
+  $text = openai_related_content_get_text($node);
+  $embedding = openai_related_content_get_embedding($text);
+  if (empty($embedding)) return [];
+  return openai_related_content_vector_search($embedding, $node->nid, $limit);
+}
+
+/**
+ * Extracts the text from a node for embedding.
+ *
+ * @param object $node
+ * @return string
+ */
+function openai_related_content_get_text($node) {
+  // Use title and body. Adjust if you want more fields.
+  $fields = [$node->title];
+  if (!empty($node->body['und'][0]['safe_value'])) {
+    $fields[] = strip_tags($node->body['und'][0]['safe_value']);
+  }
+  return implode(' ', $fields);
+}
+
+/**
+ * Gets embedding vector using OpenAI.
+ *
+ * @param string $text
+ * @return array|null
+ */
+function openai_related_content_get_embedding($text) {
+  $openai_config = config('openai.settings');
+  $api_key = key_get_key_value($openai_config->get('api_key'));
+  if (!$api_key) return NULL;
+
+  $embeddings_config = config('openai_embeddings.settings');
+  $model = $embeddings_config->get('model') ?: 'text-embedding-3-small';
+
+  $openai_api = new OpenAIApi($api_key);
+  return $openai_api->embedding($text, $model);
+}
+
+/**
+ * Search vector database for similar nodes, returning nid and title.
+ *
+ * @param array $embedding
+ * @param int $exclude_nid
+ * @param int $limit
+ * @return array
+ */
+function openai_related_content_vector_search($embedding, $exclude_nid, $limit = 3) {
+  $vector_client = openai_embeddings_get_vector_client();
+  $collection = 'amafoundation';
+  $outputFields = ['nid', 'title'];
+  $top_k = 25; // Ask for more matches to have a better shot
+
+  $matches = $vector_client->search($collection, $embedding, $top_k, $outputFields);
+
+  $related = [];
+  $seen = [];
+  foreach ($matches as $match) {
+    $nid = $match['nid'] ?? NULL;
+    $title = $match['title'] ?? '';
+
+    // Skip if no nid, if same as current, or already seen
+    if (!$nid || (string)$nid === (string)$exclude_nid || isset($seen[$nid])) {
+      continue;
+    }
+
+    // Load the node and skip unpublished or missing
+    $related_node = node_load($nid);
+    if (!$related_node || empty($related_node->status)) {
+      continue;
+    }
+
+    $related[] = ['nid' => $nid, 'title' => $title];
+    $seen[$nid] = TRUE;
+
+    // Stop if we’ve found enough
+    if (count($related) === $limit) {
+      break;
+    }
+  }
+  return $related;
+}
