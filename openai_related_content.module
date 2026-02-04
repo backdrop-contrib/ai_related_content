@@ -54,7 +54,8 @@ function openai_related_content_settings_form($form, &$form_state) {
   }
 
   // Get all available Search API indexes
-  $indexes = search_api_index_load_multiple(FALSE);  $index_options = [];
+  $indexes = search_api_index_load_multiple(FALSE);
+  $index_options = [];
   foreach ($indexes as $index_id => $index) {
     $index_options[$index_id] = $index->name;
   }
@@ -70,15 +71,68 @@ function openai_related_content_settings_form($form, &$form_state) {
     '#options' => $index_options,
     '#default_value' => $config->get('index_id') ?: '',
     '#required' => TRUE,
+    '#ajax' => [
+      'callback' => 'openai_related_content_settings_form_ajax',
+      'wrapper' => 'backend-specific-settings',
+      'method' => 'replace',
+    ],
   ];
 
-  $form['collection_name'] = [
-    '#type' => 'textfield',
-    '#title' => t('Collection Name'),
-    '#description' => t('The name of the vector database collection (e.g., "amafoundation").'),
-    '#default_value' => $config->get('collection_name') ?: 'amafoundation',
-    '#required' => TRUE,
+  // Get the selected index to determine backend type
+  $selected_index_id = !empty($form_state['values']['index_id'])
+    ? $form_state['values']['index_id']
+    : $config->get('index_id');
+
+  $backend_type = NULL;
+  if ($selected_index_id && function_exists('search_api_index_load')) {
+    $selected_index = search_api_index_load($selected_index_id);
+    if ($selected_index && $selected_index->server()) {
+      $backend_type = strtolower($selected_index->server()->class);
+    }
+  }
+
+  $form['backend_settings'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Backend-Specific Settings'),
+    '#prefix' => '<div id="backend-specific-settings">',
+    '#suffix' => '</div>',
   ];
+
+  if ($backend_type === 'milvus') {
+    $form['backend_settings']['info'] = [
+      '#markup' => '<p><em>' . t('Backend detected: <strong>Milvus</strong>') . '</em></p>',
+    ];
+
+    $form['backend_settings']['collection_name'] = [
+      '#type' => 'textfield',
+      '#title' => t('Collection Name'),
+      '#description' => t('The name of the Milvus collection to query for related content.'),
+      '#default_value' => $config->get('collection_name') ?: '',
+      '#required' => TRUE,
+    ];
+  }
+  elseif ($backend_type === 'pinecone') {
+    $form['backend_settings']['info'] = [
+      '#markup' => '<p><em>' . t('Backend detected: <strong>Pinecone</strong>') . '</em></p>' .
+        '<p>' . t('Pinecone uses namespaces which are automatically determined from your server configuration and index machine name. No additional settings needed here.') . '</p>',
+    ];
+
+    // Store empty collection_name for Pinecone (not used)
+    $form['backend_settings']['collection_name'] = [
+      '#type' => 'value',
+      '#value' => '',
+    ];
+  }
+  else {
+    $form['backend_settings']['info'] = [
+      '#markup' => '<p><em>' . t('Please select a Search API index above to see backend-specific settings.') . '</em></p>',
+    ];
+
+    $form['backend_settings']['collection_name'] = [
+      '#type' => 'value',
+      '#value' => $config->get('collection_name') ?: '',
+    ];
+  }
 
   $form['limit'] = [
     '#type' => 'number',
@@ -189,6 +243,13 @@ function openai_related_content_settings_form($form, &$form_state) {
   ];
 
   return system_settings_form($form);
+}
+
+/**
+ * AJAX callback for settings form index selection.
+ */
+function openai_related_content_settings_form_ajax($form, &$form_state) {
+  return $form['backend_settings'];
 }
 
 /**
@@ -367,19 +428,26 @@ function openai_related_content_requirements($mode = 'runtime') {
     ];
   }
 
-  // Vector client class
-  if (class_exists('SearchApiAiMilvusVectorClient')) {
+  // Vector client classes
+  $has_milvus = class_exists('SearchApiAiMilvusVectorClient');
+  $has_pinecone = class_exists('SearchApiAiPineconeVectorClient');
+
+  if ($has_milvus || $has_pinecone) {
+    $backends = [];
+    if ($has_milvus) $backends[] = 'Milvus';
+    if ($has_pinecone) $backends[] = 'Pinecone';
+
     $requirements[] = [
-      'title' => t('Milvus vector client'),
+      'title' => t('Vector client'),
       'severity' => 0,
-      'description' => t('Search API Milvus vector client is available.'),
+      'description' => t('Vector client available: @backends', ['@backends' => implode(', ', $backends)]),
     ];
   }
   else {
     $requirements[] = [
-      'title' => t('Milvus vector client'),
+      'title' => t('Vector client'),
       'severity' => 1,
-      'description' => t('SearchApiAiMilvusVectorClient class is missing. Vector searches will be disabled.'),
+      'description' => t('No vector client class found (SearchApiAiMilvusVectorClient or SearchApiAiPineconeVectorClient). Vector searches will be disabled.'),
     ];
   }
 
@@ -465,7 +533,19 @@ function openai_related_content_get_embedding($text) {
       return NULL;
     }
 
-    $result = $openai_api->embedding($text, $embeddings_model = (config('openai_embeddings.settings')->get('model') ?: 'text-embedding-3-small'));
+    // Get the embedding model from the OpenAI module config
+    // Default to text-embedding-3-small if not configured
+    $embeddings_model = 'text-embedding-3-small';
+    if ($openai_config) {
+      // Check if there's a configured embedding model in the OpenAI settings
+      $configured_model = $openai_config->get('embedding_model');
+      if (!empty($configured_model)) {
+        $embeddings_model = $configured_model;
+      }
+    }
+
+    // Call embedding method with correct parameter order: (text, model)
+    $result = $openai_api->embedding($text, $embeddings_model);
 
     // If the client returns an object/array with vector, normalize expectations.
     return $result;
@@ -477,7 +557,190 @@ function openai_related_content_get_embedding($text) {
 }
 
 /**
+ * Get the default embedding dimension for a given model.
+ *
+ * Maps embedding model names to their expected vector dimensions.
+ * This ensures consistent dimensionality across the module and external vector stores.
+ *
+ * @param string $model
+ *   The embedding model name (e.g., 'text-embedding-3-small', 'text-embedding-3-large').
+ *
+ * @return int
+ *   The default dimension for the model. Returns 1536 as a global fallback.
+ */
+function openai_related_content_get_default_embedding_dimension($model = NULL) {
+  // Model to dimension mapping
+  $model_dimensions = [
+    'text-embedding-3-small' => 1536,
+    'text-embedding-3-large' => 3072,
+    'text-embedding-ada-002' => 1536,
+    'text-embedding-ada-001' => 1024,
+  ];
+
+  // If model is provided and exists in our mapping, use it
+  if ($model && isset($model_dimensions[$model])) {
+    return $model_dimensions[$model];
+  }
+
+  // Global default dimension (OpenAI text-embedding-3-small standard)
+  return 1536;
+}
+
+/**
+ * Get the Pinecone namespace for a given index.
+ *
+ * Constructs the namespace for Pinecone operations by combining the server-level
+ * namespace (if configured) with the index machine name, or uses just the machine
+ * name if no server namespace is set.
+ *
+ * @param object $index
+ *   The Search API index object. If NULL, returns an empty string.
+ *
+ * @return string
+ *   The computed namespace for use with Pinecone queries, or empty string if
+ *   the index is invalid.
+ */
+function openai_related_content_get_pinecone_namespace($index) {
+  // Handle invalid index
+  if (empty($index) || !is_object($index)) {
+    return '';
+  }
+
+  // Check if index has a server
+  $server = NULL;
+  if (method_exists($index, 'server')) {
+    $server = $index->server();
+  }
+
+  if (empty($server)) {
+    return '';
+  }
+
+  // Build namespace: combine server namespace with index machine name if server
+  // namespace is configured; otherwise use just the machine name
+  $namespace = '';
+  if (!empty($server->options['namespace'])) {
+    $namespace = $server->options['namespace'] . '_' . $index->machine_name;
+  } else {
+    $namespace = $index->machine_name;
+  }
+
+  return $namespace;
+}
+
+/**
+ * Perform Milvus vector search and normalize results.
+ *
+ * @param object $server
+ *   The Search API server object.
+ * @param string $collection
+ *   The collection name to search.
+ * @param array $embedding
+ *   The embedding vector.
+ * @param int $limit
+ *   The number of results to limit to.
+ *
+ * @return array
+ *   Array of matches with 'nid' and 'title' keys, or empty array on failure.
+ */
+function openai_related_content_milvus_search($server, $collection, $embedding, $limit) {
+  // Milvus backend
+  if (!class_exists('SearchApiAiMilvusVectorClient')) {
+    watchdog('openai_related_content', 'Milvus vector client class not found; vector search disabled.', [], WATCHDOG_WARNING);
+    return [];
+  }
+
+  try {
+    $vector_client = new SearchApiAiMilvusVectorClient($server->options);
+    $outputFields = ['nid', 'title'];
+    $top_k = max(100, (int)$limit * 50);
+
+    $matches = $vector_client->search($collection, $embedding, $top_k, $outputFields);
+    return $matches;
+  }
+  catch (Exception $e) {
+    watchdog('openai_related_content', 'Milvus vector search failed: @msg', ['@msg' => $e->getMessage()], WATCHDOG_ERROR);
+    return [];
+  }
+}
+
+/**
+ * Perform Pinecone vector search and normalize results.
+ *
+ * @param object $server
+ *   The Search API server object.
+ * @param object $index
+ *   The Search API index object.
+ * @param array $embedding
+ *   The embedding vector.
+ * @param int $limit
+ *   The number of results to limit to.
+ *
+ * @return array
+ *   Array of matches with 'nid', 'title', and 'score' keys, or empty array on failure.
+ */
+function openai_related_content_pinecone_search($server, $index, $embedding, $limit) {
+  // Pinecone backend
+  if (!class_exists('SearchApiAiPineconeVectorClient')) {
+    watchdog('openai_related_content', 'Pinecone vector client class not found; vector search disabled.', [], WATCHDOG_WARNING);
+    return [];
+  }
+
+  try {
+    $vector_client = new SearchApiAiPineconeVectorClient($server->options);
+
+    // Get namespace using helper function for consistency
+    $namespace = openai_related_content_get_pinecone_namespace($index);
+
+    // Get dimension from index configuration or derive from embedding model
+    $dimension = NULL;
+    if (!empty($index->options['embedding_settings']['embeddings_engine_configuration']['dimension'])) {
+      $dimension = (int) $index->options['embedding_settings']['embeddings_engine_configuration']['dimension'];
+    } else {
+      // Try to get the embedding model and derive the dimension
+      $model = NULL;
+      if (!empty($index->options['embedding_settings']['model'])) {
+        $model = $index->options['embedding_settings']['model'];
+      }
+      // Use helper to get default dimension for the model
+      $dimension = openai_related_content_get_default_embedding_dimension($model);
+    }
+
+    $top_k = max(100, (int)$limit * 50);
+
+    $query_params = [
+      'vector' => $embedding,
+      'top_k' => $top_k,
+      'namespace' => $namespace,
+      'include_metadata' => TRUE,
+      'expected_dimension' => $dimension,
+    ];
+
+    $result = $vector_client->query($query_params);
+
+    // Pinecone returns results in 'matches' array
+    $matches = [];
+    if (!empty($result['matches']) && is_array($result['matches'])) {
+      foreach ($result['matches'] as $match) {
+        $metadata = $match['metadata'] ?? [];
+        $matches[] = [
+          'nid' => $metadata['nid'] ?? NULL,
+          'title' => $metadata['title'] ?? '',
+          'score' => $match['score'] ?? 0,
+        ];
+      }
+    }
+    return $matches;
+  }
+  catch (Exception $e) {
+    watchdog('openai_related_content', 'Pinecone vector search failed: @msg', ['@msg' => $e->getMessage()], WATCHDOG_ERROR);
+    return [];
+  }
+}
+
+/**
  * Search vector database for similar nodes, returning nid and title.
+ * Supports both Milvus and Pinecone backends.
  */
 function openai_related_content_vector_search($embedding, $exclude_nid, $limit = 3, $index_id = NULL) {
   // Validate embedding
@@ -505,27 +768,25 @@ function openai_related_content_vector_search($embedding, $exclude_nid, $limit =
     return [];
   }
 
-  if (!class_exists('SearchApiAiMilvusVectorClient')) {
-    watchdog('openai_related_content', 'Vector client class SearchApiAiMilvusVectorClient not found; vector search disabled.', [], WATCHDOG_WARNING);
+  $server = $index->server();
+  $server_class = strtolower($server->class);
+
+  // Determine which vector client to use based on server class
+  $matches = [];
+
+  // Route to the appropriate backend search function
+  if ($server_class === 'milvus') {
+    $matches = openai_related_content_milvus_search($server, $collection, $embedding, $limit);
+  }
+  elseif ($server_class === 'pinecone') {
+    $matches = openai_related_content_pinecone_search($server, $index, $embedding, $limit);
+  }
+  else {
+    watchdog('openai_related_content', 'Unsupported server class: @class. Only Milvus and Pinecone are supported.', ['@class' => $server_class], WATCHDOG_WARNING);
     return [];
   }
 
-  try {
-    $vector_client = new SearchApiAiMilvusVectorClient($index->server()->options);
-  }
-  catch (Exception $e) {
-    watchdog('openai_related_content', 'Failed to construct vector client: @msg', ['@msg' => $e->getMessage()], WATCHDOG_ERROR);
-    return [];
-  }
-
-  $outputFields = ['nid', 'title'];
-  $top_k = max(100, (int)$limit * 50);
-
-  try {
-    $matches = $vector_client->search($collection, $embedding, $top_k, $outputFields);
-  }
-  catch (Exception $e) {
-    watchdog('openai_related_content', 'Vector search failed: @msg', ['@msg' => $e->getMessage()], WATCHDOG_ERROR);
+  if (empty($matches)) {
     return [];
   }
 
@@ -597,7 +858,7 @@ function openai_related_content_is_excluded($nid, $details = FALSE) {
   $methods = [];
 
   // Check per-node exclusion flag (database)
-  $result = db_query("SELECT 1 FROM {openai_related_content_exclude} WHERE nid = :nid", [':nid' => $nid])->fetchField();
+  $result = db_query("SELECT 1 FROM {openai_related_content_exclude} WHERE nid = :nid", array(':nid' => $nid))->fetchField();
   if ($result) {
     $methods[] = 'per-node checkbox';
   }
@@ -724,10 +985,36 @@ function openai_related_content_test_form($form, &$form_state) {
 
   // Show current configuration
   $config = config('openai_related_content.settings');
+  $index_id = $config->get('index_id');
+
+  // Detect backend type
+  $backend_type = NULL;
+  $backend_info = '';
+  if ($index_id && function_exists('search_api_index_load')) {
+    $index = search_api_index_load($index_id);
+    if ($index && $index->server()) {
+      $backend_type = strtolower($index->server()->class);
+      $backend_info = '<li><strong>Backend Type:</strong> <span style="color: blue;">' . check_plain(ucfirst($backend_type)) . '</span></li>';
+    }
+  }
+
   $status_html .= '<h3>' . t('Current Configuration') . '</h3>';
   $status_html .= '<ul>';
-  $status_html .= '<li><strong>Index ID:</strong> ' . check_plain($config->get('index_id')) . '</li>';
-  $status_html .= '<li><strong>Collection Name:</strong> ' . check_plain($config->get('collection_name')) . '</li>';
+  $status_html .= '<li><strong>Index ID:</strong> ' . check_plain($index_id) . '</li>';
+  $status_html .= $backend_info;
+
+  if ($backend_type === 'milvus') {
+    $status_html .= '<li><strong>Collection Name (Milvus):</strong> ' . check_plain($config->get('collection_name')) . '</li>';
+  } elseif ($backend_type === 'pinecone') {
+    $status_html .= '<li><strong>Backend Notes:</strong> Pinecone uses namespaces (auto-configured from index)</li>';
+    if ($index && $index->server()) {
+      $namespace = openai_related_content_get_pinecone_namespace($index);
+      $status_html .= '<li><strong>Namespace (Pinecone):</strong> ' . check_plain($namespace) . '</li>';
+    }
+  } else {
+    $status_html .= '<li><strong>Collection Name:</strong> ' . check_plain($config->get('collection_name')) . '</li>';
+  }
+
   $status_html .= '<li><strong>Limit:</strong> ' . check_plain($config->get('limit')) . ' (type: ' . gettype($config->get('limit')) . ')</li>';
   $status_html .= '<li><strong>View Display:</strong> ' . check_plain($config->get('view_display')) . '</li>';
   $status_html .= '</ul>';
@@ -762,7 +1049,6 @@ function openai_related_content_test_form($form, &$form_state) {
       '<ul>' .
       '<li>' . l(t('View all recent log messages'), 'admin/reports/dblog') . '</li>' .
       '<li>' . l(t('View openai_related_content logs'), 'admin/reports/dblog', ['query' => ['type' => ['openai_related_content']]]) . '</li>' .
-      '<li>' . t('Clear related content cache: <code>ddev mysql -e "DELETE FROM cache WHERE cid LIKE \'openai_related_content:%\';"</code>') . '</li>' .
       '</ul>',
   ];
 
