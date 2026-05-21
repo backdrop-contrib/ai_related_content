@@ -1,11 +1,11 @@
 {
-    "_config_name": "views.view.openai_related_content",
-    "name": "openai_related_content",
+    "_config_name": "views.view.ai_related_content",
+    "name": "ai_related_content",
     "description": "",
     "tag": "",
     "disabled": false,
     "base_table": "node",
-    "human_name": "OpenAI Related Content",
+    "human_name": "AI Related Content",
     "core": "1.32.1",
     "display": {
         "default": {
@@ -79,7 +79,7 @@
                 "arguments": {
                     "nid": {
                         "id": "nid",
-                        "table": "openai_related_content",
+                        "table": "ai_related_content",
                         "field": "nid",
                         "relationship": "none",
                         "group_type": "group",

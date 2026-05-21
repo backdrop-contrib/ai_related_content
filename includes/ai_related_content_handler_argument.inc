@@ -1,14 +1,15 @@
 <?php
 
+
 /**
  * @file
- * Argument handler for OpenAI Related Content.
+ * Argument handler for AI Related Content.
  */
 
 /**
  * Argument handler to find nodes related to a given node.
  */
-class openai_related_content_handler_argument extends views_handler_argument_numeric {
+class ai_related_content_handler_argument extends views_handler_argument_numeric {
 
   /**
    * Override query to filter by related node IDs.
@@ -47,16 +48,16 @@ class openai_related_content_handler_argument extends views_handler_argument_num
 
     // Ensure $limit is a safe positive integer. If pager indicates "display
     // all" (0) or a negative value, fall back to a safe default of 3 so we
-    // never pass 0 to openai_related_content_get_related_matches().
+    // never pass 0 to ai_related_content_get_related_matches().
     $limit = (int) $limit;
     if ($limit < 1) {
       $limit = 3;
     }
 
     // Get related node IDs
-    $config = config('openai_related_content.settings');
+    $config = config('ai_related_content.settings');
     $index_id = $config->get('index_id');
-    $related = openai_related_content_get_related_matches($node, $limit, $index_id);
+    $related = ai_related_content_get_related_matches($node, $limit, $index_id);
 
     if (empty($related)) {
       // No related content - show no results

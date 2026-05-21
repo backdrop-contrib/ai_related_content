@@ -1,8 +1,8 @@
-# OpenAI Related Content - Troubleshooting Guide
+# AI Related Content - Troubleshooting Guide
 
 ## Overview
 
-This guide documents the issues encountered during development and the solutions implemented to make the OpenAI Related Content module work properly with vector databases (Milvus and Pinecone).
+This guide documents the issues encountered during development and the solutions implemented to make the AI Related Content module work properly with vector databases (Milvus and Pinecone).
 
 ## Initial Problem
 
@@ -12,7 +12,7 @@ The related content module was not returning any related nodes on the test page,
 
 ### 1. Limited Text Extraction
 
-**Problem:** The original `openai_related_content_get_text()` function only extracted text from `$node->body['und'][0]['safe_value']`, but modern Backdrop sites use Paragraphs, Layout Builder, and other field types for content.
+**Problem:** The original `ai_related_content_get_text()` function only extracted text from `$node->body['und'][0]['safe_value']`, but modern Backdrop sites use Paragraphs, Layout Builder, and other field types for content.
 
 **Impact:** Nodes with content in Paragraphs or other fields had very little or no text extracted, resulting in poor embeddings and no related content matches.
 
@@ -62,7 +62,7 @@ The original extraction logic wasn't handling these different structures properl
 
 ### 3. Database Table Missing
 
-**Problem:** The exclusion table `openai_related_content_exclude` didn't exist, causing SQL errors when checking node exclusions.
+**Problem:** The exclusion table `ai_related_content_exclude` didn't exist, causing SQL errors when checking node exclusions.
 
 **Impact:** SQL errors in watchdog logs: `SQLSTATE[42S22]: Column not found: 1054 Unknown column '1' in 'where clause'`
 
@@ -97,11 +97,11 @@ The issue was purely in the **extraction logic** - not in how the data was store
 
 ## Code Changes Made
 
-### Text Extraction Enhancement (`openai_related_content.module`)
+### Text Extraction Enhancement (`ai_related_content.module`)
 
 **Before:**
 ```php
-function openai_related_content_get_text($node) {
+function ai_related_content_get_text($node) {
   $fields = [$node->title];
   if (!empty($node->body['und'][0]['safe_value'])) {
     $fields[] = strip_tags($node->body['und'][0]['safe_value']);
@@ -112,7 +112,7 @@ function openai_related_content_get_text($node) {
 
 **After:**
 ```php
-function openai_related_content_get_text($node) {
+function ai_related_content_get_text($node) {
   // Render full node content instead of just body field
   $build = node_view($node, 'full');
   $rendered = backdrop_render($build);
@@ -121,7 +121,7 @@ function openai_related_content_get_text($node) {
 }
 ```
 
-### Node ID Extraction (`openai_related_content.module`)
+### Node ID Extraction (`ai_related_content.module`)
 
 **Before:** Only checked `$metadata['nid']`
 
@@ -142,16 +142,16 @@ elseif (!empty($match['id'])) {
 }
 ```
 
-### Error Handling (`openai_related_content.module`)
+### Error Handling (`ai_related_content.module`)
 
 ```php
 try {
-  if (db_table_exists('openai_related_content_exclude')) {
-    $result = db_query("SELECT 1 FROM {openai_related_content_exclude} WHERE nid = :nid", [':nid' => $nid])->fetchField();
+  if (db_table_exists('ai_related_content_exclude')) {
+    $result = db_query("SELECT 1 FROM {ai_related_content_exclude} WHERE nid = :nid", [':nid' => $nid])->fetchField();
   }
 }
 catch (Exception $e) {
-  watchdog('openai_related_content', 'Error checking exclusion: @error', ['@error' => $e->getMessage()], WATCHDOG_WARNING);
+  watchdog('ai_related_content', 'Error checking exclusion: @error', ['@error' => $e->getMessage()], WATCHDOG_WARNING);
 }
 ```
 
@@ -159,14 +159,14 @@ catch (Exception $e) {
 
 ### Test Page
 
-The test page (`/admin/config/content/openai-related-content/test`) now shows:
+The test page (`/admin/config/ai/related-content/test`) now shows:
 1. **Step 1: Text Extraction** - Character count and content preview
 2. **Step 2: Embedding Generation** - Success/failure with dimension count
 3. **Step 3: Vector Search** - Results and filtering statistics
 
 ### Debug Logging
 
-Watchdog logs (`/admin/reports/dblog?type=openai_related_content`) now include:
+Watchdog logs (`/admin/reports/dblog?type=ai_related_content`) now include:
 - Search parameters and raw responses
 - Filtering statistics showing why matches were excluded
 - Sample match data for debugging

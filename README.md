@@ -1,7 +1,7 @@
 
-# OpenAI Related Content
+# AI Related Content
 
-Displays related nodes using OpenAI embeddings and a vector search.
+Displays related nodes using AI embeddings and a vector search.
 
 ## Installation
 
@@ -11,7 +11,7 @@ Displays related nodes using OpenAI embeddings and a vector search.
 ## Issues
 
 Bugs and feature requests should be reported in the
-[Issue Queue](https://github.com/backdrop-contrib/openai_related_content/issues).
+[Issue Queue](https://github.com/backdrop-contrib/ai_related_content/issues).
 
 ## Current Maintainer
 
@@ -19,7 +19,9 @@ Bugs and feature requests should be reported in the
 
 ## Credits
 
-Created for Backdrop CMS by [Justin Keiser](https://github.com/keiserjb)
+- Created for Backdrop CMS by [Justin Keiser](https://github.com/keiserjb)
+- Inspired by the Drupal module of the same name.
+- Developed with AI assistance.
 
 ## License
 

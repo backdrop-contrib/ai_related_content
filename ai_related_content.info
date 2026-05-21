@@ -1,0 +1,8 @@
+name = AI Related Content
+description = Displays related nodes using AI embeddings and vector search.
+backdrop = 1.x
+type = module
+package = AI
+dependencies[] = ai
+dependencies[] = ai_search
+configure = admin/config/ai/ai-related-content
