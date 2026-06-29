@@ -80,7 +80,7 @@ function ai_related_content_settings_form($form, &$form_state) {
   $form['index_id'] = [
     '#type' => 'select',
     '#title' => t('Search API Index'),
-    '#description' => t('Select a vector-capable Search API index (Milvus or Pinecone] that contains your embeddings. The vector search server used comes from the server assigned to this index in Search API.'),
+    '#description' => t('Select a vector-capable Search API index (Milvus or Pinecone) that contains your embeddings. The vector search server used comes from the server assigned to this index in Search API.'),
     '#options' => $index_options,
     '#default_value' => $configured_index_id,
     '#required' => TRUE,
@@ -191,7 +191,7 @@ function ai_related_content_settings_form($form, &$form_state) {
         $is_block = ($type === 'block');
         $title = !empty($display->display_title) ? $display->display_title : $display_id;
         $prefix = $is_block ? t('Block') : strtoupper($type);
-        $label = t('@view (@type]: @display', [
+        $label = t('@view (@type): @display', [
           '@view' => $view->human_name ?: $view->name,
           '@type' => $prefix,
           '@display' => $title,
@@ -258,9 +258,9 @@ function ai_related_content_settings_form($form, &$form_state) {
 
   $form['exclusions']['info'] = [
     '#markup' => '<div class="messages info"><strong>Exclusion Methods:</strong><ul>' .
-      '<li><strong>URL-based (this form]:</strong> Enter URLs/paths above - applies globally</li>' .
-      '<li><strong>Per-node (node edit form]:</strong> Check "Exclude from related content" when editing a node</li>' .
-      '<li><strong>View filters (recommended for complex rules]:</strong> Edit the view and add filters for content type, taxonomy, etc.</li>' .
+      '<li><strong>URL-based (this form):</strong> Enter URLs/paths above - applies globally</li>' .
+      '<li><strong>Per-node (node edit form):</strong> Check "Exclude from related content" when editing a node</li>' .
+      '<li><strong>View filters (recommended for complex rules):</strong> Edit the view and add filters for content type, taxonomy, etc.</li>' .
       '</ul></div>',
   ];
 
@@ -278,9 +278,7 @@ function ai_related_content_settings_form_ajax($form, &$form_state) {
  * Submit handler to clear related content cache.
  */
 function ai_related_content_clear_cache_submit($form, &$form_state) {
-  db_delete('cache')
-    ->condition('cid', 'ai_related_content:%', 'LIKE')
-    ->execute();
+  ai_related_content_invalidate_caches();
 
   backdrop_set_message(t('Related content cache cleared successfully.'), 'status');
 }
@@ -299,7 +297,7 @@ function ai_related_content_get_node_view_mode_options() {
     if (!empty($entity_info['view modes']) && is_array($entity_info['view modes'])) {
       foreach ($entity_info['view modes'] as $machine_name => $view_mode) {
         $label = !empty($view_mode['label']) ? $view_mode['label'] : $machine_name;
-        $options[$machine_name] = $label . ' (' . $machine_name . ']';
+        $options[$machine_name] = $label . ' (' . $machine_name . ')';
       }
     }
   }
@@ -307,13 +305,13 @@ function ai_related_content_get_node_view_mode_options() {
   // Fallback and guarantees.
   if (empty($options)) {
     $options = [
-      'full' => t('Full') . ' (full]',
-      'teaser' => t('Teaser') . ' (teaser]',
-      'rss' => t('RSS') . ' (rss]',
+      'full' => t('Full') . ' (full)',
+      'teaser' => t('Teaser') . ' (teaser)',
+      'rss' => t('RSS') . ' (rss)',
     ];
   }
   elseif (!isset($options['full'])) {
-    $options = ['full' => t('Full') . ' (full]'] + $options;
+    $options = ['full' => t('Full') . ' (full)'] + $options;
   }
 
   return $options;
@@ -404,7 +402,10 @@ function ai_related_content_block_view($delta = '') {
 
   $config = config('ai_related_content.settings');
   $view_mode = $config->get('node_view_mode') ?: 'full';
-  $cache_key = 'ai_related_content:' . $node->nid . ':' . $view_mode;
+  // Results are filtered by node_access() for the user who primes the cache,
+  // so the cache must vary by role — otherwise a privileged user's results
+  // (including rendered teasers) would be served to anonymous visitors.
+  $cache_key = 'ai_related_content:' . $node->nid . ':' . $view_mode . ':' . ai_related_content_role_cache_suffix();
   $cached = cache_get($cache_key, 'cache');
 
   if ($cached && isset($cached->data['output'])) {
@@ -467,7 +468,8 @@ function ai_related_content_get_related_matches($node, $limit = 3, $index_id = N
     $index_id = $config->get('index_id') ?: NULL;
   }
   $view_mode = $config->get('node_view_mode') ?: 'full';
-  $cache_key = 'ai_related_content_matches:' . $node->nid . ':' . $limit . ':' . ($index_id ?: 'default') . ':' . $view_mode;
+  // Vary by role: matches are node_access()-filtered for the priming user.
+  $cache_key = 'ai_related_content_matches:' . $node->nid . ':' . $limit . ':' . ($index_id ?: 'default') . ':' . $view_mode . ':' . ai_related_content_role_cache_suffix();
   $cached = cache_get($cache_key, 'cache');
 
   if ($cached && isset($cached->data)) {
@@ -483,6 +485,19 @@ function ai_related_content_get_related_matches($node, $limit = 3, $index_id = N
   cache_set($cache_key, $matches, 'cache', REQUEST_TIME + 604800);
 
   return $matches;
+}
+
+/**
+ * Cache key suffix representing the current user's roles.
+ *
+ * Related-content results are access-filtered at build time, so cached
+ * entries are only valid for users with the same role set.
+ */
+function ai_related_content_role_cache_suffix() {
+  global $user;
+  $roles = !empty($user->roles) ? (array) $user->roles : ['anonymous'];
+  sort($roles);
+  return substr(hash('sha256', implode(',', $roles)), 0, 12);
 }
 
 /**
@@ -805,16 +820,14 @@ function ai_related_content_get_pinecone_namespace($index) {
     return '';
   }
 
-  // Build namespace: combine server namespace with index machine name if server
-  // namespace is configured; otherwise use just the machine name
-  $namespace = '';
-  if (!empty($server->options['namespace'])) {
-    $namespace = $server->options['namespace'] . '_' . $index->machine_name;
-  } else {
-    $namespace = $index->machine_name;
-  }
+  // Match AIPineconeService::getNamespace(): the server-level namespace wins
+  // when set, otherwise the index machine name is used. Vectors were indexed
+  // under that namespace, so deriving anything else returns zero matches.
+  $namespace = !empty($server->options['namespace'])
+    ? trim((string) $server->options['namespace'])
+    : $index->machine_name;
 
-  return $namespace;
+  return preg_replace('/[^A-Za-z0-9_\-]/', '_', $namespace);
 }
 
 /**
@@ -852,7 +865,7 @@ function ai_related_content_milvus_search($server, $collection, $embedding, $lim
 
     // Keep logging only when no matches are returned to avoid noisy logs.
     if (empty($matches)) {
-      watchdog('ai_related_content', 'Milvus search returned no matches for collection @collection (database @database, embedding_dim @dim].', [
+      watchdog('ai_related_content', 'Milvus search returned no matches for collection @collection (database @database, embedding_dim @dim).', [
         '@collection' => $collection,
         '@database' => $database,
         '@dim' => is_array($embedding) ? count($embedding) : 0,
@@ -887,16 +900,16 @@ function ai_related_content_milvus_search($server, $collection, $embedding, $lim
         elseif (!empty($match['entity_id']) && (empty($match['entity_type']) || $match['entity_type'] === 'node')) {
           $nid = $match['entity_id'];
         }
-        elseif (!empty($match['backdrop_entity_id']) && preg_match('/^node:(\d+]/', $match['backdrop_entity_id'], $m)) {
+        elseif (!empty($match['backdrop_entity_id']) && preg_match('/^node:(\d+)/', $match['backdrop_entity_id'], $m)) {
           $nid = $m[1];
         }
-        elseif (!empty($match['backdrop_entity_id']) && preg_match('/entity:node\/(\d+]/', $match['backdrop_entity_id'], $m)) {
+        elseif (!empty($match['backdrop_entity_id']) && preg_match('/entity:node\/(\d+)/', $match['backdrop_entity_id'], $m)) {
           $nid = $m[1];
         }
-        elseif (!empty($match['backdrop_long_id']) && preg_match('/entity:node\/(\d+]/', $match['backdrop_long_id'], $m)) {
+        elseif (!empty($match['backdrop_long_id']) && preg_match('/entity:node\/(\d+)/', $match['backdrop_long_id'], $m)) {
           $nid = $m[1];
         }
-        elseif (!empty($match['id']) && preg_match('/entity:node\/(\d+]/', $match['id'], $m)) {
+        elseif (!empty($match['id']) && preg_match('/entity:node\/(\d+)/', $match['id'], $m)) {
           $nid = $m[1];
         }
 
@@ -989,15 +1002,15 @@ function ai_related_content_pinecone_search($server, $index, $embedding, $limit)
         elseif (!empty($metadata['entity_id']) && (!empty($metadata['entity_type']) && $metadata['entity_type'] === 'node')) {
           $nid = $metadata['entity_id'];
         }
-        elseif (!empty($metadata['backdrop_entity_id']) && preg_match('/^node:(\d+]/', $metadata['backdrop_entity_id'], $m)) {
+        elseif (!empty($metadata['backdrop_entity_id']) && preg_match('/^node:(\d+)/', $metadata['backdrop_entity_id'], $m)) {
           $nid = $m[1];
         }
         elseif (!empty($match['id'])) {
           // Try to extract node ID from the Pinecone vector ID (often formatted as "node:123:field_name")
-          if (preg_match('/^node[:\-_]?(\d+]/i', $match['id'], $m)) {
+          if (preg_match('/^node[:\-_]?(\d+)/i', $match['id'], $m)) {
             $nid = $m[1];
           }
-          elseif (preg_match('/entity[:\-_]?node[:\-_\/]?(\d+]/i', $match['id'], $m)) {
+          elseif (preg_match('/entity[:\-_]?node[:\-_\/]?(\d+)/i', $match['id'], $m)) {
             $nid = $m[1];
           }
         }
@@ -1036,9 +1049,13 @@ function ai_related_content_vector_search($embedding, $exclude_nid, $limit = 3, 
   // Get config
   $config = config('ai_related_content.settings');
   if (!$index_id) {
-    $index_id = $config->get('index_id') ?: 'milvus_search_2';
+    $index_id = $config->get('index_id') ?: '';
   }
-  $collection = $config->get('collection_name') ?: 'amafoundation';
+  if ($index_id === '') {
+    watchdog('ai_related_content', 'No Search API index configured; cannot perform vector search. Configure one at admin/config/ai/ai-related-content.', [], WATCHDOG_WARNING);
+    return [];
+  }
+  $collection = $config->get('collection_name') ?: '';
 
   // Load the Search API index and get the server
   if (!function_exists('search_api_index_load')) {
@@ -1072,6 +1089,14 @@ function ai_related_content_vector_search($embedding, $exclude_nid, $limit = 3, 
 
   // Route to the appropriate backend search function
   if ($server_class === 'milvus') {
+    // Fall back to the collection configured on the Search API server itself.
+    if ($collection === '' && !empty($server->options['collection'])) {
+      $collection = $server->options['collection'];
+    }
+    if ($collection === '') {
+      watchdog('ai_related_content', 'No Milvus collection configured (module settings or server options); cannot perform vector search.', [], WATCHDOG_WARNING);
+      return [];
+    }
     $matches = ai_related_content_milvus_search($server, $collection, $embedding, $limit);
   }
   elseif ($server_class === 'pinecone') {
@@ -1337,19 +1362,19 @@ function ai_related_content_test_form($form, &$form_state) {
   $status_html .= $backend_info;
 
   if ($backend_type === 'milvus') {
-    $status_html .= '<li><strong>Collection Name (Milvus]:</strong> ' . check_plain($config->get('collection_name')) . '</li>';
+    $status_html .= '<li><strong>Collection Name (Milvus):</strong> ' . check_plain($config->get('collection_name')) . '</li>';
   } elseif ($backend_type === 'pinecone') {
-    $status_html .= '<li><strong>Backend Notes:</strong> Pinecone uses namespaces (auto-configured from index]</li>';
+    $status_html .= '<li><strong>Backend Notes:</strong> Pinecone uses namespaces (auto-configured from index)</li>';
     if ($index && $index->server()) {
       $namespace = ai_related_content_get_pinecone_namespace($index);
-      $status_html .= '<li><strong>Namespace (Pinecone]:</strong> ' . check_plain($namespace) . '</li>';
+      $status_html .= '<li><strong>Namespace (Pinecone):</strong> ' . check_plain($namespace) . '</li>';
     }
   } else {
     $status_html .= '<li><strong>Collection Name:</strong> ' . check_plain($config->get('collection_name')) . '</li>';
   }
 
-  $status_html .= '<li><strong>Limit:</strong> ' . check_plain($config->get('limit')) . ' (type: ' . gettype($config->get('limit')) . ']</li>';
-  $status_html .= '<li><strong>Node View Mode (extraction]:</strong> ' . check_plain($config->get('node_view_mode') ?: 'full') . '</li>';
+  $status_html .= '<li><strong>Limit:</strong> ' . check_plain($config->get('limit')) . ' (type: ' . gettype($config->get('limit')) . ')</li>';
+  $status_html .= '<li><strong>Node View Mode (extraction):</strong> ' . check_plain($config->get('node_view_mode') ?: 'full') . '</li>';
   $status_html .= '<li><strong>View Display:</strong> ' . check_plain($config->get('view_display')) . '</li>';
   $status_html .= '</ul>';
 
@@ -1403,7 +1428,7 @@ function ai_related_content_test_form_submit($form, &$form_state) {
   $excluded_details = ai_related_content_is_excluded($nid, TRUE);
   if (!empty($excluded_details['excluded'])) {
     $methods = !empty($excluded_details['methods']) ? $excluded_details['methods'] : [];
-    $exclusion_info = '<div class="messages warning"><strong>' . t('Note: This node is excluded from related content') . '</strong> (' . implode(', ', $methods) . ']</div>';
+    $exclusion_info = '<div class="messages warning"><strong>' . t('Note: This node is excluded from related content') . '</strong> (' . implode(', ', $methods) . ')</div>';
   }
 
   $results_html = '<h3>' . t('Test Results for Node @nid: @title', ['@nid' => $nid, '@title' => $test_node->title]) . '</h3>';
@@ -1414,7 +1439,7 @@ function ai_related_content_test_form_submit($form, &$form_state) {
   $text = ai_related_content_get_text($test_node);
   $text_preview = strlen($text) > 500 ? substr($text, 0, 500) . '...' : $text;
   $results_html .= '<p><strong>Text length:</strong> ' . strlen($text) . ' characters</p>';
-  $results_html .= '<details><summary>Text preview (first 500 chars]</summary><pre style="white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; background: #f5f5f5; padding: 10px; max-height: 200px; overflow: auto;">' . check_plain($text_preview) . '</pre></details>';
+  $results_html .= '<details><summary>Text preview (first 500 chars)</summary><pre style="white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; background: #f5f5f5; padding: 10px; max-height: 200px; overflow: auto;">' . check_plain($text_preview) . '</pre></details>';
 
   if (empty($text) || strlen($text) < 50) {
     $results_html .= '<p style="color: orange;"><strong>Warning:</strong> Very little text extracted. This may result in poor embeddings.</p>';
@@ -1439,11 +1464,8 @@ function ai_related_content_test_form_submit($form, &$form_state) {
   $results_html .= '<h4>' . t('Step 3: Vector Search') . '</h4>';
   $results_html .= '<p>' . t('Requesting @limit related items...', ['@limit' => $limit]) . '</p>';
 
-  // Clear cache first to ensure fresh results
-  $view_mode = $config->get('node_view_mode') ?: 'full';
-  $index_id = $config->get('index_id') ?: 'default';
-  $cache_key = 'ai_related_content_matches:' . $nid . ':' . $limit . ':' . $index_id . ':' . $view_mode;
-  cache_clear_all($cache_key, 'cache');
+  // Clear all match caches for this node first to ensure fresh results.
+  cache_clear_all('ai_related_content_matches:' . $nid . ':', 'cache', TRUE);
 
   $related = ai_related_content_get_related_matches($test_node, $limit);
 
@@ -1465,7 +1487,7 @@ function ai_related_content_test_form_submit($form, &$form_state) {
       $rel_node = node_load($match['nid']);
       $title = $rel_node ? $rel_node->title : $match['title'];
       $status_icon = ($rel_node && $rel_node->status) ? '✓' : '✗';
-      $results_html .= '<li>' . $status_icon . ' ' . l($title, 'node/' . $match['nid']) . ' (nid: ' . $match['nid'] . ']';
+      $results_html .= '<li>' . $status_icon . ' ' . l($title, 'node/' . $match['nid']) . ' (nid: ' . $match['nid'] . ')';
       if (!$rel_node) {
         $results_html .= ' <span style="color: red;">[Node not found]</span>';
       }
@@ -1495,22 +1517,18 @@ function ai_related_content_test_form_submit($form, &$form_state) {
  *   Node id to target, or NULL to clear all related caches.
  */
 function ai_related_content_invalidate_caches($nid = NULL) {
+  // cache_clear_all() with $wildcard works on any cache backend, unlike a
+  // direct db_delete() against the cache table.
   if ($nid) {
-    // Remove the rendered block cache for that node.
-    db_delete('cache')->condition('cid', 'ai_related_content:' . (int) $nid, '=')->execute();
-
-    // Remove the match-list caches for that source node (limit/index vary).
-    db_delete('cache')->condition('cid', 'ai_related_content_matches:' . (int) $nid . ':%', 'LIKE')->execute();
-
-    // Also remove any global caches that could contain the node as a candidate.
-    // This is conservative but safe: it avoids showing deleted/changed nodes in
-    // other nodes' recommendations for up to the TTL.
-    db_delete('cache')->condition('cid', 'ai_related_content:%', 'LIKE')->execute();
+    // Remove caches for that source node, plus any other node's cached output
+    // that could contain this node as a candidate (conservative but safe).
+    cache_clear_all('ai_related_content_matches:' . (int) $nid . ':', 'cache', TRUE);
+    cache_clear_all('ai_related_content:', 'cache', TRUE);
   }
   else {
     // Clear all module-related caches.
-    db_delete('cache')->condition('cid', 'ai_related_content:%', 'LIKE')->execute();
-    db_delete('cache')->condition('cid', 'ai_related_content_matches:%', 'LIKE')->execute();
+    cache_clear_all('ai_related_content:', 'cache', TRUE);
+    cache_clear_all('ai_related_content_matches:', 'cache', TRUE);
   }
 
   watchdog('ai_related_content', 'Invalidated related-content caches for nid: @nid', ['@nid' => $nid ?: 'all'], WATCHDOG_NOTICE);
