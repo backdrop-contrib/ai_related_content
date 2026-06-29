@@ -476,6 +476,12 @@ function ai_related_content_get_related_matches($node, $limit = 3, $index_id = N
     return $cached->data;
   }
 
+  // Bail before making an external embedding request when no index is set.
+  if (empty($index_id)) {
+    watchdog('ai_related_content', 'No Search API index configured; skipping related-content lookup for node @nid.', ['@nid' => $node->nid], WATCHDOG_WARNING);
+    return [];
+  }
+
   $text = ai_related_content_get_text($node);
   $embedding = ai_related_content_get_embedding($text, $index_id);
   if (empty($embedding)) return [];
@@ -488,16 +494,23 @@ function ai_related_content_get_related_matches($node, $limit = 3, $index_id = N
 }
 
 /**
- * Cache key suffix representing the current user's roles.
+ * Cache key suffix representing the current user's access context.
  *
- * Related-content results are access-filtered at build time, so cached
- * entries are only valid for users with the same role set.
+ * Related-content results are access-filtered via node_access() at build time.
+ * When modules implement hook_node_grants(), access can differ per user even
+ * within the same role set, so the UID is included to prevent cross-user leaks.
+ * On sites with only role-based access control, the UID is omitted so that
+ * cached results are shared across users with identical roles.
  */
 function ai_related_content_role_cache_suffix() {
   global $user;
   $roles = !empty($user->roles) ? (array) $user->roles : ['anonymous'];
   sort($roles);
-  return substr(hash('sha256', implode(',', $roles)), 0, 12);
+  $key = implode(',', $roles);
+  if (count(module_implements('node_grants')) > 0) {
+    $key .= ':uid=' . (int) $user->uid;
+  }
+  return substr(hash('sha256', $key), 0, 12);
 }
 
 /**
@@ -1002,8 +1015,8 @@ function ai_related_content_pinecone_search($server, $index, $embedding, $limit)
         elseif (!empty($metadata['entity_id']) && (!empty($metadata['entity_type']) && $metadata['entity_type'] === 'node')) {
           $nid = $metadata['entity_id'];
         }
-        elseif (!empty($metadata['backdrop_entity_id']) && preg_match('/^node:(\d+)/', $metadata['backdrop_entity_id'], $m)) {
-          $nid = $m[1];
+        elseif (!empty($metadata['backdrop_entity_id']) && preg_match('/^(?:node:(\d+)|entity:node\/(\d+))/i', $metadata['backdrop_entity_id'], $m)) {
+          $nid = $m[1] ?: $m[2];
         }
         elseif (!empty($match['id'])) {
           // Try to extract node ID from the Pinecone vector ID (often formatted as "node:123:field_name")
@@ -1520,9 +1533,9 @@ function ai_related_content_invalidate_caches($nid = NULL) {
   // cache_clear_all() with $wildcard works on any cache backend, unlike a
   // direct db_delete() against the cache table.
   if ($nid) {
-    // Remove caches for that source node, plus any other node's cached output
-    // that could contain this node as a candidate (conservative but safe).
-    cache_clear_all('ai_related_content_matches:' . (int) $nid . ':', 'cache', TRUE);
+    // Clear all match lists: the changed node may appear as a candidate in any
+    // other node's cached recommendations, not just its own source key.
+    cache_clear_all('ai_related_content_matches:', 'cache', TRUE);
     cache_clear_all('ai_related_content:', 'cache', TRUE);
   }
   else {
