@@ -467,19 +467,21 @@ function ai_related_content_get_related_matches($node, $limit = 3, $index_id = N
   if (!$index_id) {
     $index_id = $config->get('index_id') ?: NULL;
   }
+
+  // Guard before cache lookup: no index means no valid cache key to read from
+  // and no embedding request to make.
+  if (empty($index_id)) {
+    watchdog('ai_related_content', 'No Search API index configured; skipping related-content lookup for node @nid.', ['@nid' => $node->nid], WATCHDOG_WARNING);
+    return [];
+  }
+
   $view_mode = $config->get('node_view_mode') ?: 'full';
   // Vary by role: matches are node_access()-filtered for the priming user.
-  $cache_key = 'ai_related_content_matches:' . $node->nid . ':' . $limit . ':' . ($index_id ?: 'default') . ':' . $view_mode . ':' . ai_related_content_role_cache_suffix();
+  $cache_key = 'ai_related_content_matches:' . $node->nid . ':' . $limit . ':' . $index_id . ':' . $view_mode . ':' . ai_related_content_role_cache_suffix();
   $cached = cache_get($cache_key, 'cache');
 
   if ($cached && isset($cached->data)) {
     return $cached->data;
-  }
-
-  // Bail before making an external embedding request when no index is set.
-  if (empty($index_id)) {
-    watchdog('ai_related_content', 'No Search API index configured; skipping related-content lookup for node @nid.', ['@nid' => $node->nid], WATCHDOG_WARNING);
-    return [];
   }
 
   $text = ai_related_content_get_text($node);
@@ -843,9 +845,10 @@ function ai_related_content_get_pinecone_namespace($index) {
   // Match AIPineconeService::getNamespace(): the server-level namespace wins
   // when set, otherwise the index machine name is used. Vectors were indexed
   // under that namespace, so deriving anything else returns zero matches.
-  $namespace = !empty($server->options['namespace'])
-    ? trim((string) $server->options['namespace'])
-    : $index->machine_name;
+  // Trim before the emptiness check so whitespace-only values fall through
+  // to the machine_name fallback rather than winning as a blank namespace.
+  $server_namespace = trim((string) ($server->options['namespace'] ?? ''));
+  $namespace = $server_namespace !== '' ? $server_namespace : $index->machine_name;
 
   return preg_replace('/[^A-Za-z0-9_\-]/', '_', $namespace);
 }
