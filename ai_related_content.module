@@ -497,17 +497,24 @@ function ai_related_content_get_related_matches($node, $limit = 3, $index_id = N
  * Cache key suffix representing the current user's access context.
  *
  * Related-content results are access-filtered via node_access() at build time.
- * When modules implement hook_node_grants(), access can differ per user even
- * within the same role set, so the UID is included to prevent cross-user leaks.
- * On sites with only role-based access control, the UID is omitted so that
- * cached results are shared across users with identical roles.
+ * Two hooks can produce per-user access decisions that differ within the same
+ * role set:
+ *   - hook_node_grants(): record-level grants (e.g. content_access, og).
+ *   - hook_node_access(): arbitrary per-user allow/deny logic. The node
+ *     module's own implementation is purely role-based, so it is excluded;
+ *     any other implementor may vary per user.
+ * When either condition is true the UID is folded into the key to prevent
+ * cross-user cache leaks. On plain role-only sites the UID is omitted so
+ * results are still shared across users with identical roles.
  */
 function ai_related_content_role_cache_suffix() {
   global $user;
   $roles = !empty($user->roles) ? (array) $user->roles : ['anonymous'];
   sort($roles);
   $key = implode(',', $roles);
-  if (count(module_implements('node_grants')) > 0) {
+  $needs_uid = count(module_implements('node_grants')) > 0
+    || count(array_diff(module_implements('node_access'), ['node'])) > 0;
+  if ($needs_uid) {
     $key .= ':uid=' . (int) $user->uid;
   }
   return substr(hash('sha256', $key), 0, 12);
@@ -1375,7 +1382,16 @@ function ai_related_content_test_form($form, &$form_state) {
   $status_html .= $backend_info;
 
   if ($backend_type === 'milvus') {
-    $status_html .= '<li><strong>Collection Name (Milvus):</strong> ' . check_plain($config->get('collection_name')) . '</li>';
+    // Resolve the effective collection the same way ai_related_content_vector_search() does:
+    // module config first, then server-level fallback.
+    $effective_collection = $config->get('collection_name') ?: '';
+    if ($effective_collection === '' && $index && $index->server() && !empty($index->server()->options['collection'])) {
+      $effective_collection = $index->server()->options['collection'];
+      $status_html .= '<li><strong>Collection Name (Milvus):</strong> ' . check_plain($effective_collection) . ' <em>(resolved from server settings)</em></li>';
+    }
+    else {
+      $status_html .= '<li><strong>Collection Name (Milvus):</strong> ' . check_plain($effective_collection) . '</li>';
+    }
   } elseif ($backend_type === 'pinecone') {
     $status_html .= '<li><strong>Backend Notes:</strong> Pinecone uses namespaces (auto-configured from index)</li>';
     if ($index && $index->server()) {
