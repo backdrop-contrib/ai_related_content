@@ -6,3 +6,4 @@ package = AI
 dependencies[] = ai
 dependencies[] = ai_search
 configure = admin/config/ai/ai-related-content
+tests[] = tests/ai_related_content.test

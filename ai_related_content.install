@@ -24,6 +24,35 @@ function ai_related_content_schema() {
     'primary key' => ['nid'],
   ];
 
+  $schema['ai_related_content_views'] = [
+    'description' => 'Daily node page-view counts used for trending/popularity blending.',
+    'fields' => [
+      'nid' => [
+        'description' => 'Node ID.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'day_bucket' => [
+        'description' => 'Day bucket: floor(unix timestamp / 86400), UTC.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'hits' => [
+        'description' => 'Number of views recorded for this node on this day.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+    ],
+    'primary key' => ['nid', 'day_bucket'],
+    'indexes' => [
+      'day_bucket' => ['day_bucket'],
+    ],
+  ];
+
   return $schema;
 }
 
@@ -73,19 +102,21 @@ function ai_related_content_ensure_node_view_mode(Config $config) {
  * configuration files or create schema here. The function can remain empty.
  */
 function ai_related_content_install() {
-  if (!module_load_install('ai_upgrade')) { return []; }
-  ai_upgrade_module_install('ai_related_content');
+  if (module_load_install('ai_upgrade') && function_exists('ai_upgrade_module_install')) {
+    ai_upgrade_module_install('ai_related_content');
+  }
 
   $config = config('ai_related_content.settings');
   ai_related_content_ensure_view_display($config);
   ai_related_content_ensure_node_view_mode($config);
+  ai_related_content_ensure_popularity_defaults($config);
 }
 
 /**
  * Implements hook_requirements().
  */
 function ai_related_content_requirements($phase) {
-  if (!module_load_install('ai_upgrade')) { return []; }
+  if (!module_load_install('ai_upgrade') || !function_exists('ai_upgrade_module_requirements')) { return []; }
   return ai_upgrade_module_requirements($phase, 'ai_related_content');
 }
 
@@ -106,10 +137,57 @@ function ai_related_content_update_1003() {
 }
 
 /**
+ * Ensure popularity settings have default values.
+ *
+ * @param Config $config
+ *   The ai_related_content.settings config object.
+ */
+function ai_related_content_ensure_popularity_defaults(Config $config) {
+  $defaults = [
+    'popularity_enabled' => FALSE,
+    'popularity_tracking' => TRUE,
+    'popularity_weight' => 0.3,
+    'popularity_half_life' => 7,
+    'popularity_window' => 30,
+    'popularity_cache_ttl' => 3600,
+    'popularity_flood_limit' => 60,
+  ];
+  $changed = FALSE;
+  foreach ($defaults as $key => $value) {
+    if ($config->get($key) === NULL) {
+      $config->set($key, $value);
+      $changed = TRUE;
+    }
+  }
+  if ($changed) {
+    $config->save();
+  }
+}
+
+/**
+ * Add the page-view table and popularity settings for trending blending.
+ */
+function ai_related_content_update_1004() {
+  $schema = ai_related_content_schema();
+  if (!db_table_exists('ai_related_content_views')) {
+    db_create_table('ai_related_content_views', $schema['ai_related_content_views']);
+  }
+  ai_related_content_ensure_popularity_defaults(config('ai_related_content.settings'));
+}
+
+/**
+ * Add the popularity blending on/off setting (off by default).
+ */
+function ai_related_content_update_1005() {
+  ai_related_content_ensure_popularity_defaults(config('ai_related_content.settings'));
+}
+
+/**
  * Implements hook_uninstall().
  */
 function ai_related_content_uninstall() {
   db_drop_table('ai_related_content_exclude');
+  db_drop_table('ai_related_content_views');
 
   // Delete the views and settings config.
   $config = config('views.view.ai_related_content');

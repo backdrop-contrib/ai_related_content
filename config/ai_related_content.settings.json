@@ -5,6 +5,13 @@
   "limit": 3,
   "node_view_mode": "full",
   "view_display": "ai_related_content:block_1",
-  "excluded_urls": []
+  "excluded_urls": [],
+  "popularity_enabled": false,
+  "popularity_tracking": true,
+  "popularity_weight": 0.3,
+  "popularity_half_life": 7,
+  "popularity_window": 30,
+  "popularity_cache_ttl": 3600,
+  "popularity_flood_limit": 60
 }
 
