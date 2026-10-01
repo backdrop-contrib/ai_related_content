@@ -1,0 +1,128 @@
+<?php
+
+/**
+ * @file
+ * Tests for the AI Related Content module.
+ */
+
+class AIRelatedContentTestCase extends BackdropUnitTestCase {
+
+  /**
+   * Set up test environment.
+   */
+  public function setUp() {
+    parent::setUp();
+    require_once dirname(__FILE__) . '/../ai_related_content.module';
+    require_once dirname(__FILE__) . '/../includes/related.tools.inc';
+  }
+
+  /**
+   * Test agent tool definitions and permission schemas.
+   */
+  public function testToolsDefinitions() {
+    $tools = ai_related_content_tools_definitions();
+
+    $this->assertTrue(isset($tools['get_related_content']), 'get_related_content tool is registered.');
+    $this->assertTrue(isset($tools['get_related_content_exclusions']), 'get_related_content_exclusions tool is registered.');
+    $this->assertTrue(isset($tools['set_node_related_content_exclusion']), 'set_node_related_content_exclusion tool is registered.');
+
+    // Permissions check.
+    $this->assertEqual($tools['get_related_content']['permission'], 'access content');
+    $this->assertEqual($tools['get_related_content_exclusions']['permission'], 'administer site configuration');
+    $this->assertEqual($tools['set_node_related_content_exclusion']['permission'], 'administer site configuration');
+
+    // Required arguments check.
+    $this->assertEqual($tools['set_node_related_content_exclusion']['definition']['function']['parameters']['required'], ['nid', 'excluded']);
+  }
+
+  /**
+   * Test vector backend support across MariaDB, pgvector, Milvus, and Pinecone.
+   */
+  public function testVectorBackendResolution() {
+    // Check that known backend keys are handled.
+    $backends = ['milvus', 'pinecone', 'mariadb_vector', 'mariadb', 'pgvector'];
+    foreach ($backends as $backend) {
+      // The function should evaluate without errors.
+      $result = ai_related_content_ensure_vector_client($backend);
+      $this->assertTrue(is_bool($result), "ai_related_content_ensure_vector_client('$backend') returns a boolean.");
+    }
+  }
+
+  /**
+   * Test embedding dimension fallback helper.
+   */
+  public function testEmbeddingDimension() {
+    $dim_small = ai_related_content_get_default_embedding_dimension('text-embedding-3-small');
+    $this->assertEqual($dim_small, 1536, 'text-embedding-3-small resolves to 1536 dimensions.');
+
+    $dim_large = ai_related_content_get_default_embedding_dimension('text-embedding-3-large');
+    $this->assertEqual($dim_large, 3072, 'text-embedding-3-large resolves to 3072 dimensions.');
+
+    $dim_fallback = ai_related_content_get_default_embedding_dimension('unknown-custom-model');
+    $this->assertEqual($dim_fallback, 1536, 'Unknown model resolves to default 1536 dimensions.');
+  }
+
+  /**
+   * Test invalid exclusion arguments.
+   */
+  public function testIsExcludedInvalid() {
+    $this->assertFalse(ai_related_content_is_excluded(0), 'Node ID 0 is not excluded.');
+    $details = ai_related_content_is_excluded(0, TRUE);
+    $this->assertFalse($details['excluded'], 'Details for Node ID 0 returns excluded FALSE.');
+  }
+
+  /**
+   * Test popularity blending re-ranks within the related pool.
+   */
+  public function testPopularityBlend() {
+    $items = [
+      ['nid' => 1, 'score' => 0.90],
+      ['nid' => 2, 'score' => 0.85],
+      ['nid' => 3, 'score' => 0.80],
+    ];
+
+    $ranked = ai_related_content_popularity_blend($items, [], 0.3);
+    $this->assertEqual(array_column($ranked, 'nid'), [1, 2, 3], 'No views keeps similarity order.');
+
+    $ranked = ai_related_content_popularity_blend($items, [3 => 500], 0.0);
+    $this->assertEqual(array_column($ranked, 'nid'), [1, 2, 3], 'Weight 0 ignores popularity.');
+
+    $ranked = ai_related_content_popularity_blend($items, [3 => 500], 0.6);
+    $this->assertEqual($ranked[0]['nid'], 3, 'A heavily trending candidate rises with a high weight.');
+
+    $ranked = ai_related_content_popularity_blend($items, [2 => 50, 3 => 1], 0.3);
+    $this->assertEqual(array_column($ranked, 'nid'), [1, 2, 3], 'Modest views do not overturn a clear similarity lead at 0.3.');
+
+    // Distance metrics (ascending, lower is better) keep best-first intent.
+    $distances = [
+      ['nid' => 1, 'score' => 0.10],
+      ['nid' => 2, 'score' => 0.20],
+    ];
+    $ranked = ai_related_content_popularity_blend($distances, [], 0.3);
+    $this->assertEqual($ranked[0]['nid'], 1, 'Ascending distance scores are treated as best-first.');
+    $this->assertEqual($ranked[0]['similarity'], 1.0, 'Best distance normalises to similarity 1.');
+
+    // Missing scores fall back to rank order.
+    $ranked = ai_related_content_popularity_blend([['nid' => 7], ['nid' => 8]], [8 => 10], 0.6);
+    $this->assertEqual($ranked[0]['nid'], 8, 'Rank-based similarity still blends with popularity.');
+  }
+
+  /**
+   * Test bot user-agent detection for the view beacon.
+   */
+  public function testPopularityBotDetection() {
+    $this->assertTrue(ai_related_content_popularity_is_bot(''), 'Empty user agent is a bot.');
+    $this->assertTrue(ai_related_content_popularity_is_bot('Mozilla/5.0 (compatible; Googlebot/2.1)'), 'Googlebot is a bot.');
+    $this->assertTrue(ai_related_content_popularity_is_bot('curl/8.5.0'), 'curl is a bot.');
+    $this->assertFalse(ai_related_content_popularity_is_bot('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36'), 'Desktop Chrome is not a bot.');
+  }
+
+  /**
+   * Test day bucketing.
+   */
+  public function testPopularityDay() {
+    $this->assertEqual(ai_related_content_popularity_day(0), 0, 'Epoch is day 0.');
+    $this->assertEqual(ai_related_content_popularity_day(86399), 0, 'Last second of day 0.');
+    $this->assertEqual(ai_related_content_popularity_day(86400), 1, 'Midnight starts day 1.');
+  }
+}

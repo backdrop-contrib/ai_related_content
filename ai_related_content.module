@@ -41,6 +41,14 @@ function ai_related_content_menu() {
     'type' => MENU_LOCAL_TASK,
   ];
 
+  // Page-view beacon endpoint for popularity tracking. Hit from JS so it
+  // still counts views served from the anonymous page cache.
+  $items['ai-related-content/hit'] = [
+    'page callback' => 'ai_related_content_popularity_hit_callback',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  ];
+
   return $items;
 }
 
@@ -69,7 +77,7 @@ function ai_related_content_settings_form($form, &$form_state) {
   }
 
   if (empty($index_options)) {
-    backdrop_set_message(t('No vector-capable Search API indexes found. Configure a Milvus or Pinecone index with an embedding vector field first.'), 'warning');
+    backdrop_set_message(t('No vector-capable Search API indexes found. Configure a vector index (MariaDB Vector, pgvector, Milvus, Pinecone, or other supported backend) with an embedding vector field first.'), 'warning');
   }
 
   $configured_index_id = $config->get('index_id') ?: '';
@@ -80,7 +88,7 @@ function ai_related_content_settings_form($form, &$form_state) {
   $form['index_id'] = [
     '#type' => 'select',
     '#title' => t('Search API Index'),
-    '#description' => t('Select a vector-capable Search API index (Milvus or Pinecone) that contains your embeddings. The vector search server used comes from the server assigned to this index in Search API.'),
+    '#description' => t('Select a vector-capable Search API index (MariaDB Vector, pgvector, Milvus, Pinecone, or other supported backend) that contains your embeddings. The vector search server used comes from the server assigned to this index in Search API.'),
     '#options' => $index_options,
     '#default_value' => $configured_index_id,
     '#required' => TRUE,
@@ -134,6 +142,39 @@ function ai_related_content_settings_form($form, &$form_state) {
     $form['backend_settings']['collection_name'] = [
       '#type' => 'value',
       '#value' => '',
+    ];
+  }
+  elseif ($backend_type === 'mariadb_vector') {
+    $form['backend_settings']['info'] = [
+      '#markup' => '<p><em>' . t('Backend detected: <strong>MariaDB Vector</strong>') . '</em></p>' .
+        '<p>' . t('MariaDB Vector stores and queries embeddings directly in database tables managed by Search API AI. No additional settings needed here.') . '</p>',
+    ];
+
+    $form['backend_settings']['collection_name'] = [
+      '#type' => 'value',
+      '#value' => '',
+    ];
+  }
+  elseif ($backend_type === 'pgvector') {
+    $form['backend_settings']['info'] = [
+      '#markup' => '<p><em>' . t('Backend detected: <strong>PostgreSQL pgvector</strong>') . '</em></p>' .
+        '<p>' . t('pgvector stores and queries embeddings directly in PostgreSQL vector tables managed by Search API AI. No additional settings needed here.') . '</p>',
+    ];
+
+    $form['backend_settings']['collection_name'] = [
+      '#type' => 'value',
+      '#value' => '',
+    ];
+  }
+  elseif (!empty($backend_type)) {
+    $form['backend_settings']['info'] = [
+      '#markup' => '<p><em>' . t('Backend detected: <strong>@backend</strong>', ['@backend' => check_plain(ucfirst($backend_type))]) . '</em></p>' .
+        '<p>' . t('Vector search is handled automatically by the @backend Search API provider. No additional settings needed here.', ['@backend' => check_plain(ucfirst($backend_type))]) . '</p>',
+    ];
+
+    $form['backend_settings']['collection_name'] = [
+      '#type' => 'value',
+      '#value' => $config->get('collection_name') ?: '',
     ];
   }
   else {
@@ -220,6 +261,88 @@ function ai_related_content_settings_form($form, &$form_state) {
       '#markup' => l(t('Open the selected View display'), $edit_path, ['attributes' => ['target' => '_blank', 'rel' => 'noopener noreferrer']]),    ];
   }
 
+  // Popularity / trending blending.
+  $form['popularity'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Popularity (trending)'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#description' => t('Blend recent page views into the ranking so trending items among the related candidates rise to the top. Only related candidates are re-ranked; unrelated popular content is never pulled in.'),
+  ];
+
+  $form['popularity']['popularity_enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Blend popularity into related content ranking'),
+    '#description' => t('When off, related content is ranked by similarity only. View tracking can stay on so history builds up before you enable blending.'),
+    '#default_value' => (bool) $config->get('popularity_enabled'),
+  ];
+  $blend_states = [
+    'visible' => [
+      ':input[name="popularity_enabled"]' => ['checked' => TRUE],
+    ],
+  ];
+
+  $form['popularity']['popularity_tracking'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Track node page views'),
+    '#description' => t('Records one view per node per browser session via a small JavaScript beacon (works with the page cache). Bots and users with the "administer nodes" permission are not counted.'),
+    '#default_value' => (bool) $config->get('popularity_tracking'),
+  ];
+
+  $form['popularity']['popularity_weight'] = [
+    '#type' => 'number',
+    '#title' => t('Popularity weight'),
+    '#description' => t('0 = pure similarity. 1 = order the related candidates purely by trending views. 0.2–0.4 is a good starting point.'),
+    '#states' => $blend_states,
+    '#default_value' => (float) ($config->get('popularity_weight') ?? 0),
+    '#min' => 0,
+    '#max' => 1,
+    '#step' => 0.05,
+    '#required' => TRUE,
+  ];
+
+  $form['popularity']['popularity_half_life'] = [
+    '#type' => 'number',
+    '#title' => t('Trending half-life (days)'),
+    '#states' => $blend_states,
+    '#description' => t('A view from this many days ago counts half as much as a view today.'),
+    '#default_value' => (int) ($config->get('popularity_half_life') ?: 7),
+    '#min' => 1,
+    '#max' => 365,
+    '#required' => TRUE,
+  ];
+
+  $form['popularity']['popularity_window'] = [
+    '#type' => 'number',
+    '#title' => t('View history to keep (days)'),
+    '#description' => t('Older daily counts are deleted on cron and ignored when scoring.'),
+    '#default_value' => (int) ($config->get('popularity_window') ?: 30),
+    '#min' => 1,
+    '#max' => 365,
+    '#required' => TRUE,
+  ];
+
+  $form['popularity']['popularity_cache_ttl'] = [
+    '#type' => 'number',
+    '#title' => t('Result cache lifetime when blending (seconds)'),
+    '#states' => $blend_states,
+    '#description' => t('While blending is on with a weight above 0, related results are cached this long instead of 1 week so trending changes show up.'),
+    '#default_value' => (int) ($config->get('popularity_cache_ttl') ?: 3600),
+    '#min' => 60,
+    '#max' => 604800,
+    '#required' => TRUE,
+  ];
+
+  $form['popularity']['popularity_flood_limit'] = [
+    '#type' => 'number',
+    '#title' => t('Max counted views per IP per hour'),
+    '#description' => t('Limits view inflation from a single address. 0 disables the limit.'),
+    '#default_value' => (int) ($config->get('popularity_flood_limit') ?? 60),
+    '#min' => 0,
+    '#max' => 10000,
+    '#required' => TRUE,
+  ];
+
   // Cache management
   $form['cache_management'] = [
     '#type' => 'fieldset',
@@ -229,7 +352,7 @@ function ai_related_content_settings_form($form, &$form_state) {
   ];
 
   $form['cache_management']['info'] = [
-    '#markup' => '<p>' . t('Related content blocks are cached for 1 week. If you change the configuration or reindex content, you should clear the related content cache.') . '</p>',
+    '#markup' => '<p>' . t('Related content blocks are cached for 1 week (or the popularity cache lifetime while blending is on). If you change the configuration or reindex content, you should clear the related content cache.') . '</p>',
   ];
 
   $form['cache_management']['clear_cache'] = [
@@ -264,7 +387,17 @@ function ai_related_content_settings_form($form, &$form_state) {
       '</ul></div>',
   ];
 
-  return system_settings_form($form);
+  $form = system_settings_form($form);
+  // Ranking inputs may have changed; cached results would hide that.
+  $form['#submit'][] = 'ai_related_content_settings_form_submit_clear';
+  return $form;
+}
+
+/**
+ * Settings submit: clear cached results so new ranking settings apply.
+ */
+function ai_related_content_settings_form_submit_clear($form, &$form_state) {
+  ai_related_content_invalidate_caches();
 }
 
 /**
@@ -320,12 +453,14 @@ function ai_related_content_get_node_view_mode_options() {
 /**
  * Determine whether a Search API index is suitable for vector related-content lookup.
  *
+ * Supports MariaDB Vector, PostgreSQL pgvector, Milvus, Pinecone, or any
+ * registered Search API AI RAG backend.
+ *
  * @param SearchApiIndex $index
  *   The Search API index object.
  *
  * @return bool
- *   TRUE when index has a Milvus/Pinecone backend and at least one
- *   llm_vector_embedding field.
+ *   TRUE when index has a vector-capable backend and embedding fields.
  */
 function ai_related_content_index_is_vector_capable($index) {
   if (empty($index) || !is_object($index) || !method_exists($index, 'server')) {
@@ -338,10 +473,24 @@ function ai_related_content_index_is_vector_capable($index) {
   }
 
   $server_class = strtolower($server->class);
-  if (!in_array($server_class, ['milvus', 'pinecone'], TRUE)) {
+
+  // Check if the server backend is registered with ai_search RAG or is a known vector provider.
+  $is_supported_server = FALSE;
+  if (function_exists('ai_search_index_supports_rag') && ai_search_index_supports_rag($index, $server)) {
+    $is_supported_server = TRUE;
+  }
+  elseif (ai_related_content_ensure_vector_client($server_class)) {
+    $is_supported_server = TRUE;
+  }
+  elseif (in_array($server_class, ['milvus', 'pinecone', 'mariadb_vector', 'mariadb', 'pgvector'], TRUE)) {
+    $is_supported_server = TRUE;
+  }
+
+  if (!$is_supported_server) {
     return FALSE;
   }
 
+  // Check for vector embedding field.
   if (!empty($index->options['fields']) && is_array($index->options['fields'])) {
     foreach ($index->options['fields'] as $field_info) {
       if (!empty($field_info['real_type']) && $field_info['real_type'] === 'llm_vector_embedding') {
@@ -350,7 +499,26 @@ function ai_related_content_index_is_vector_capable($index) {
     }
   }
 
+  // If the server supports RAG and the index or server has embedding settings, consider it capable.
+  if (!empty($index->options['embedding_settings']['embeddings_engine'])) {
+    return TRUE;
+  }
+  if (!empty($server->options['embeddings_engine'])) {
+    return TRUE;
+  }
+
   return FALSE;
+}
+
+/**
+ * Implements hook_ai_tools().
+ */
+function ai_related_content_ai_tools() {
+  if (!module_exists('ai_tools')) {
+    return [];
+  }
+  module_load_include('inc', 'ai_related_content', 'includes/related.tools');
+  return ai_related_content_tools_definitions();
 }
 
 /**
@@ -435,8 +603,7 @@ function ai_related_content_block_view($delta = '') {
       $output .= '</div>';
     }
 
-    // Cache for 1 week (604800 seconds)
-    cache_set($cache_key, ['output' => $output], 'cache', REQUEST_TIME + 604800);
+    cache_set($cache_key, ['output' => $output], 'cache', ai_related_content_cache_expire());
   }
 
   return [
@@ -489,8 +656,7 @@ function ai_related_content_get_related_matches($node, $limit = 3, $index_id = N
   if (empty($embedding)) return [];
   $matches = ai_related_content_vector_search($embedding, $node->nid, $limit, $index_id);
 
-  // Cache for 1 week (604800 seconds)
-  cache_set($cache_key, $matches, 'cache', REQUEST_TIME + 604800);
+  cache_set($cache_key, $matches, 'cache', ai_related_content_cache_expire());
 
   return $matches;
 }
@@ -600,11 +766,14 @@ function ai_related_content_resolve_api_key($provider_id = NULL) {
 /**
  * Ensure a Search API AI vector client class is available.
  *
+ * Supports Milvus, Pinecone, MariaDB Vector, pgvector, and any
+ * registered Search API AI RAG backend.
+ *
  * @param string $backend
- *   Supported backend key: 'milvus' or 'pinecone'.
+ *   Supported backend key (e.g. 'milvus', 'pinecone', 'mariadb_vector', 'pgvector').
  *
  * @return bool
- *   TRUE when the class is available, FALSE otherwise.
+ *   TRUE when the class or backend is available, FALSE otherwise.
  */
 function ai_related_content_ensure_vector_client($backend) {
   $definitions = [
@@ -618,18 +787,46 @@ function ai_related_content_ensure_vector_client($backend) {
       'file' => 'includes/AiSearchPineconeVectorClient',
       'class' => 'AiSearchPineconeVectorClient',
     ],
+    'mariadb_vector' => [
+      'module' => 'ai_search_provider_mariadb',
+      'file' => 'includes/MariadbVectorService',
+      'class' => 'MariadbVectorService',
+    ],
+    'mariadb' => [
+      'module' => 'ai_search_provider_mariadb',
+      'file' => 'includes/MariadbVectorService',
+      'class' => 'MariadbVectorService',
+    ],
+    'pgvector' => [
+      'module' => 'ai_search_provider_pgvector',
+      'file' => 'includes/PgvectorService',
+      'class' => 'PgvectorService',
+    ],
   ];
 
-  if (empty($definitions[$backend])) {
-    return FALSE;
+  if (!empty($definitions[$backend])) {
+    $definition = $definitions[$backend];
+    if (!class_exists($definition['class']) && module_exists($definition['module'])) {
+      @module_load_include('php', $definition['module'], $definition['file']);
+      @module_load_include('inc', $definition['module'], $definition['file']);
+    }
+    if (class_exists($definition['class'])) {
+      return TRUE;
+    }
   }
 
-  $definition = $definitions[$backend];
-  if (!class_exists($definition['class']) && module_exists($definition['module'])) {
-    @module_load_include('php', $definition['module'], $definition['file']);
+  // Also check dynamic RAG backends registered with ai_search.
+  if (function_exists('ai_search_rag_backend_info')) {
+    foreach (ai_search_rag_backend_info() as $def) {
+      if (!empty($def['server_classes']) && in_array($backend, $def['server_classes'], TRUE)) {
+        if (!empty($def['query_callback']) && is_callable($def['query_callback'])) {
+          return TRUE;
+        }
+      }
+    }
   }
 
-  return class_exists($definition['class']);
+  return FALSE;
 }
 
 /**
@@ -659,26 +856,48 @@ function ai_related_content_runtime_requirements($mode = 'runtime') {
     ];
   }
 
-  // Vector client classes
-  $has_milvus = ai_related_content_ensure_vector_client('milvus');
-  $has_pinecone = ai_related_content_ensure_vector_client('pinecone');
+  // Vector client classes / backends
+  $backend_candidates = [
+    'mariadb_vector' => 'MariaDB Vector',
+    'pgvector' => 'PostgreSQL pgvector',
+    'milvus' => 'Milvus',
+    'pinecone' => 'Pinecone',
+  ];
+  $available_backends = [];
+  foreach ($backend_candidates as $key => $label) {
+    if (ai_related_content_ensure_vector_client($key)) {
+      $available_backends[] = $label;
+    }
+  }
 
-  if ($has_milvus || $has_pinecone) {
-    $backends = [];
-    if ($has_milvus) $backends[] = 'Milvus';
-    if ($has_pinecone) $backends[] = 'Pinecone';
+  // Also discover any dynamic RAG backends registered with ai_search.
+  if (function_exists('ai_search_rag_backend_info')) {
+    foreach (ai_search_rag_backend_info() as $backend_id => $def) {
+      $classes = !empty($def['server_classes']) ? $def['server_classes'] : [];
+      $label = !empty($def['name']) ? $def['name'] : ucfirst(str_replace('_', ' ', $backend_id));
+      if (!in_array($label, $available_backends, TRUE)) {
+        foreach ($classes as $class) {
+          if (ai_related_content_ensure_vector_client($class)) {
+            $available_backends[] = $label;
+            break;
+          }
+        }
+      }
+    }
+  }
 
+  if (!empty($available_backends)) {
     $requirements[] = [
       'title' => t('Vector client'),
       'severity' => 0,
-      'description' => t('Vector client available: @backends', ['@backends' => implode(', ', $backends)]),
+      'description' => t('Vector backends available: @backends', ['@backends' => implode(', ', array_unique($available_backends))]),
     ];
   }
   else {
     $requirements[] = [
       'title' => t('Vector client'),
       'severity' => 1,
-      'description' => t('No vector client class found (AiSearchMilvusVectorClient or AiSearchPineconeVectorClient). Vector searches will be disabled.'),
+      'description' => t('No vector provider classes found. Vector searches will be disabled until a vector provider module (such as MariaDB Vector, pgvector, Milvus, or Pinecone) is enabled.'),
     ];
   }
 
@@ -700,6 +919,8 @@ function ai_related_content_runtime_requirements($mode = 'runtime') {
 
   // API key configured?
   $api_key = ai_related_content_resolve_api_key();
+  $provider_id = function_exists('ai_default_provider_id') ? ai_default_provider_id() : '';
+  $requires_key = !in_array($provider_id, ['ollama', 'browser'], TRUE);
 
   if (!empty($api_key)) {
     $requirements[] = [
@@ -708,11 +929,18 @@ function ai_related_content_runtime_requirements($mode = 'runtime') {
       'description' => t('AI API key appears configured.'),
     ];
   }
+  elseif (!$requires_key && !empty($provider_id)) {
+    $requirements[] = [
+      'title' => t('AI API key'),
+      'severity' => 0,
+      'description' => t('Active AI provider "@provider" does not require an API key.', ['@provider' => $provider_id]),
+    ];
+  }
   else {
     $requirements[] = [
       'title' => t('AI API key'),
       'severity' => 1,
-      'description' => t('No AI API key configured. Embeddings and related content will not work.'),
+      'description' => t('No AI API key configured. Embeddings and related content may not work unless using a keyless local provider (such as Ollama).'),
     ];
   }
 
@@ -733,21 +961,50 @@ function ai_related_content_runtime_requirements($mode = 'runtime') {
 function ai_related_content_get_embedding($text, $index_id = NULL) {
   $embedding_model = NULL;
   $expected_dimension = NULL;
+  $index = NULL;
+  $server = NULL;
 
   // Preferred path: use Search API AI model from the selected index
   if (!empty($index_id) && function_exists('search_api_index_load')) {
     $index = search_api_index_load($index_id);
-    if ($index && !empty($index->options['embedding_settings']['embeddings_engine'])) {
-      $embedding_model = $index->options['embedding_settings']['embeddings_engine'];
-      $expected_dimension = !empty($index->options['embedding_settings']['embeddings_engine_configuration']['dimension'])
-        ? (int) $index->options['embedding_settings']['embeddings_engine_configuration']['dimension']
-        : NULL;
+    if ($index) {
+      $server = method_exists($index, 'server') ? $index->server() : NULL;
+      if (function_exists('ai_search_rag_index_embedding_model')) {
+        $embedding_model = ai_search_rag_index_embedding_model($index, $server);
+      }
+      elseif (!empty($index->options['embedding_settings']['embeddings_engine'])) {
+        $embedding_model = $index->options['embedding_settings']['embeddings_engine'];
+      }
+      elseif ($server && !empty($server->options['embeddings_engine'])) {
+        $embedding_model = $server->options['embeddings_engine'];
+      }
+
+      if (function_exists('ai_search_rag_index_embedding_dimension')) {
+        $expected_dimension = ai_search_rag_index_embedding_dimension($index, $server);
+      }
+      elseif (!empty($index->options['embedding_settings']['embeddings_engine_configuration']['dimension'])) {
+        $expected_dimension = (int) $index->options['embedding_settings']['embeddings_engine_configuration']['dimension'];
+      }
     }
   }
 
-  // Fallback path: legacy AI module embedding config.
+  // Fallback path: AI module default embedding config.
   if (empty($embedding_model)) {
-    $embedding_model = config_get('ai.settings', 'embedding_model') ?: 'text-embedding-3-small';
+    if (function_exists('ai_default_model')) {
+      $embedding_model = ai_default_model('embeddings');
+    }
+    if (empty($embedding_model)) {
+      $embedding_model = config_get('ai.settings', 'default_embedding_model') ?: config_get('ai.settings', 'embedding_model') ?: 'text-embedding-3-small';
+    }
+  }
+
+  if (empty($expected_dimension)) {
+    $expected_dimension = ai_related_content_get_default_embedding_dimension($embedding_model);
+  }
+
+  // Apply model-specific task prefixes if defined.
+  if (function_exists('ai_search_apply_embedding_task_prefix')) {
+    $text = ai_search_apply_embedding_task_prefix($text, $embedding_model, 'query');
   }
 
   try {
@@ -763,7 +1020,8 @@ function ai_related_content_get_embedding($text, $index_id = NULL) {
       $vector = $client->embedding($text, $model_to_use);
       if (is_array($vector) && isset($vector[0]) && is_numeric($vector[0])) {
         if ($expected_dimension && count($vector) !== $expected_dimension) {
-          watchdog('ai_related_content', 'Embedding dimension mismatch. Expected @expected, got @actual.', [
+          watchdog('ai_related_content', 'Embedding dimension mismatch for model @model. Expected @expected, got @actual.', [
+            '@model' => $embedding_model,
             '@expected' => $expected_dimension,
             '@actual' => count($vector),
           ], WATCHDOG_WARNING);
@@ -795,6 +1053,13 @@ function ai_related_content_get_embedding($text, $index_id = NULL) {
  *   The default dimension for the model. Returns 1536 as a global fallback.
  */
 function ai_related_content_get_default_embedding_dimension($model = NULL) {
+  if (!empty($model) && function_exists('ai_get_embedding_dimension')) {
+    $dim = ai_get_embedding_dimension($model);
+    if (!empty($dim) && is_numeric($dim) && (int) $dim > 0) {
+      return (int) $dim;
+    }
+  }
+
   // Model to dimension mapping
   $model_dimensions = [
     'text-embedding-3-small' => 1536,
@@ -941,10 +1206,12 @@ function ai_related_content_milvus_search($server, $collection, $embedding, $lim
           $title = $match['title'];
         }
 
+        $score = isset($match['score']) ? (float) $match['score'] : (isset($match['distance']) ? (float) $match['distance'] : 0.0);
         if ($nid) {
           $normalized[] = [
             'nid' => $nid,
             'title' => $title,
+            'score' => $score,
           ];
         }
       }
@@ -1110,24 +1377,99 @@ function ai_related_content_vector_search($embedding, $exclude_nid, $limit = 3, 
   // Determine which vector client to use based on server class
   $matches = [];
 
-  // Route to the appropriate backend search function
-  if ($server_class === 'milvus') {
-    // Fall back to the collection configured on the Search API server itself.
-    if ($collection === '' && !empty($server->options['collection'])) {
-      $collection = $server->options['collection'];
+  // Check if this server supports RAG through the unified ai_search backend registry
+  // (supports MariaDB Vector, pgvector, Milvus, Pinecone, and any new RAG backends).
+  $rag_definition = function_exists('ai_search_get_rag_backend_definition')
+    ? ai_search_get_rag_backend_definition($server, $index)
+    : NULL;
+
+  if ($rag_definition && !empty($rag_definition['query_callback']) && is_callable($rag_definition['query_callback'])) {
+    $dimension = $expected_dimension ?: ai_related_content_get_default_embedding_dimension();
+    if (function_exists('ai_search_rag_index_embedding_dimension')) {
+      $dimension = ai_search_rag_index_embedding_dimension($index, $server);
     }
-    if ($collection === '') {
-      watchdog('ai_related_content', 'No Milvus collection configured (module settings or server options); cannot perform vector search.', [], WATCHDOG_WARNING);
+    $top_k = max(100, (int) $limit * 50);
+
+    try {
+      $vector_results = ai_search_query_backend($server, $index, $embedding, $dimension, $top_k);
+      $raw_matches = function_exists('ai_search_backend_result_matches')
+        ? ai_search_backend_result_matches($server, $vector_results, $index)
+        : [];
+
+      if (is_array($raw_matches)) {
+        foreach ($raw_matches as $raw_match) {
+          if (!is_array($raw_match)) {
+            continue;
+          }
+          $match_nid = NULL;
+          $match_title = '';
+          $match_score = function_exists('ai_search_match_score')
+            ? ai_search_match_score($raw_match)
+            : (isset($raw_match['score']) ? (float) $raw_match['score'] : 0.0);
+
+          // Extract entity reference and NID.
+          if (function_exists('ai_search_match_entity_reference')) {
+            $ref = ai_search_match_entity_reference($raw_match);
+            if (!empty($ref['entity_id']) && (empty($ref['entity_type']) || $ref['entity_type'] === 'node')) {
+              $match_nid = (int) $ref['entity_id'];
+            }
+          }
+          if (!$match_nid && !empty($raw_match['nid'])) {
+            $match_nid = (int) $raw_match['nid'];
+          }
+          elseif (!$match_nid && !empty($raw_match['id']) && preg_match('/^entity:([^\/]+)\/(\d+)(?::.*)?$/', $raw_match['id'], $m)) {
+            if ($m[1] === 'node') {
+              $match_nid = (int) $m[2];
+            }
+          }
+
+          // Extract title.
+          if (function_exists('ai_search_match_title')) {
+            $metadata = !empty($raw_match['metadata']) && is_array($raw_match['metadata']) ? $raw_match['metadata'] : [];
+            $match_title = ai_search_match_title('node', NULL, $metadata);
+          }
+          if ($match_title === '' && !empty($raw_match['title'])) {
+            $match_title = (string) $raw_match['title'];
+          }
+
+          if ($match_nid) {
+            $matches[] = [
+              'nid' => $match_nid,
+              'title' => $match_title,
+              'score' => $match_score,
+            ];
+          }
+        }
+      }
+    }
+    catch (\Exception $e) {
+      watchdog('ai_related_content', 'Vector search failed using unified backend @class: @msg', [
+        '@class' => $server_class,
+        '@msg' => $e->getMessage(),
+      ], WATCHDOG_WARNING);
+    }
+  }
+
+  // Fallback to legacy direct methods if unified backend did not return matches
+  if (empty($matches)) {
+    if ($server_class === 'milvus') {
+      // Fall back to the collection configured on the Search API server itself.
+      if ($collection === '' && !empty($server->options['collection'])) {
+        $collection = $server->options['collection'];
+      }
+      if ($collection === '') {
+        watchdog('ai_related_content', 'No Milvus collection configured (module settings or server options); cannot perform vector search.', [], WATCHDOG_WARNING);
+        return [];
+      }
+      $matches = ai_related_content_milvus_search($server, $collection, $embedding, $limit);
+    }
+    elseif ($server_class === 'pinecone') {
+      $matches = ai_related_content_pinecone_search($server, $index, $embedding, $limit);
+    }
+    else {
+      watchdog('ai_related_content', 'Unsupported server class: @class. Only vector-capable Search API backends are supported.', ['@class' => $server_class], WATCHDOG_WARNING);
       return [];
     }
-    $matches = ai_related_content_milvus_search($server, $collection, $embedding, $limit);
-  }
-  elseif ($server_class === 'pinecone') {
-    $matches = ai_related_content_pinecone_search($server, $index, $embedding, $limit);
-  }
-  else {
-    watchdog('ai_related_content', 'Unsupported server class: @class. Only Milvus and Pinecone are supported.', ['@class' => $server_class], WATCHDOG_WARNING);
-    return [];
   }
 
   if (empty($matches)) {
@@ -1137,6 +1479,11 @@ function ai_related_content_vector_search($embedding, $exclude_nid, $limit = 3, 
   if (empty($matches) || !is_array($matches)) {
     return [];
   }
+
+  // When blending in popularity, gather a larger pool of related candidates
+  // to re-rank; otherwise stop at $limit as before.
+  $popularity_weight = ai_related_content_popularity_weight();
+  $pool_size = $popularity_weight > 0 ? max((int) $limit * 5, 15) : (int) $limit;
 
   $related = [];
   $seen = [];
@@ -1155,6 +1502,7 @@ function ai_related_content_vector_search($embedding, $exclude_nid, $limit = 3, 
   foreach ($matches as $match) {
     $nid = $match['nid'] ?? NULL;
     $title = $match['title'] ?? '';
+    $score = isset($match['score']) ? (float) $match['score'] : NULL;
     if ($nid) {
       $sample_nids[] = $nid;
     }
@@ -1194,14 +1542,37 @@ function ai_related_content_vector_search($embedding, $exclude_nid, $limit = 3, 
       $stats['no_access']++;
       continue;
     }
-    $related[] = ['nid' => $nid, 'title' => $title];
+    $related_item = ['nid' => $nid, 'title' => $title];
+    if ($score !== NULL) {
+      $related_item['score'] = $score;
+    }
+    $related[] = $related_item;
     $seen[$nid] = TRUE;
     $stats['accepted']++;
 
-    if (count($related) >= (int)$limit) {
+    if (count($related) >= $pool_size) {
       break;
     }
   }
+
+  if ($popularity_weight > 0 && !empty($related)) {
+    $popularity = ai_related_content_popularity_scores(array_column($related, 'nid'));
+    $related = ai_related_content_popularity_blend($related, $popularity, $popularity_weight);
+  }
+  $related = array_slice($related, 0, (int) $limit);
+
+  // Allow other modules to alter the related content matches.
+  $context = [
+    'exclude_nid' => $exclude_nid,
+    'limit' => $limit,
+    'index_id' => $index_id,
+    'server' => $server,
+    'index' => $index,
+    'matches' => $matches,
+    'stats' => $stats,
+    'popularity_weight' => $popularity_weight,
+  ];
+  backdrop_alter('ai_related_content_matches', $related, $context);
 
   return $related;
 }
@@ -1359,7 +1730,7 @@ function ai_related_content_test_form($form, &$form_state) {
   $requirements = ai_related_content_runtime_requirements('runtime');
   $status_html = '<h3>' . t('Module Status') . '</h3><ul>';
   foreach ($requirements as $req) {
-    $status = $req['severity'] === 0 ? '<span style="color: green;">OK</span>' : '<span style="color: orange;">Warning</span>';
+    $status = $req['severity'] === 0 ? '<span style="color: var(--gin-color-green, green);">OK</span>' : '<span style="color: var(--gin-color-warning, orange);">Warning</span>';
     $status_html .= '<li><strong>' . $req['title'] . ':</strong> ' . $status . ' - ' . $req['description'] . '</li>';
   }
   $status_html .= '</ul>';
@@ -1375,7 +1746,7 @@ function ai_related_content_test_form($form, &$form_state) {
     $index = search_api_index_load($index_id);
     if ($index && $index->server()) {
       $backend_type = strtolower($index->server()->class);
-      $backend_info = '<li><strong>Backend Type:</strong> <span style="color: blue;">' . check_plain(ucfirst($backend_type)) . '</span></li>';
+      $backend_info = '<li><strong>Backend Type:</strong> <span style="color: var(--gin-color-primary, blue);">' . check_plain(ucfirst($backend_type)) . '</span></li>';
     }
   }
 
@@ -1401,8 +1772,12 @@ function ai_related_content_test_form($form, &$form_state) {
       $namespace = ai_related_content_get_pinecone_namespace($index);
       $status_html .= '<li><strong>Namespace (Pinecone):</strong> ' . check_plain($namespace) . '</li>';
     }
+  } elseif ($backend_type === 'mariadb_vector') {
+    $status_html .= '<li><strong>Backend Notes:</strong> MariaDB Vector manages embedding tables directly in the database.</li>';
+  } elseif ($backend_type === 'pgvector') {
+    $status_html .= '<li><strong>Backend Notes:</strong> PostgreSQL pgvector manages vector tables directly in PostgreSQL.</li>';
   } else {
-    $status_html .= '<li><strong>Collection Name:</strong> ' . check_plain($config->get('collection_name')) . '</li>';
+    $status_html .= '<li><strong>Backend Notes:</strong> ' . check_plain(ucfirst($backend_type ?: 'Unknown')) . ' vector provider</li>';
   }
 
   $status_html .= '<li><strong>Limit:</strong> ' . check_plain($config->get('limit')) . ' (type: ' . gettype($config->get('limit')) . ')</li>';
@@ -1471,10 +1846,10 @@ function ai_related_content_test_form_submit($form, &$form_state) {
   $text = ai_related_content_get_text($test_node);
   $text_preview = strlen($text) > 500 ? substr($text, 0, 500) . '...' : $text;
   $results_html .= '<p><strong>Text length:</strong> ' . strlen($text) . ' characters</p>';
-  $results_html .= '<details><summary>Text preview (first 500 chars)</summary><pre style="white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; background: #f5f5f5; padding: 10px; max-height: 200px; overflow: auto;">' . check_plain($text_preview) . '</pre></details>';
+  $results_html .= '<details><summary>Text preview (first 500 chars)</summary><pre style="white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; background:var(--gin-bg-layer2,#f5f5f5);color:var(--gin-color-text,inherit); padding: 10px; max-height: 200px; overflow: auto;">' . check_plain($text_preview) . '</pre></details>';
 
   if (empty($text) || strlen($text) < 50) {
-    $results_html .= '<p style="color: orange;"><strong>Warning:</strong> Very little text extracted. This may result in poor embeddings.</p>';
+    $results_html .= '<p style="color: var(--gin-color-warning, orange);"><strong>Warning:</strong> Very little text extracted. This may result in poor embeddings.</p>';
   }
 
   // Step 2: Show embedding results.
@@ -1482,19 +1857,23 @@ function ai_related_content_test_form_submit($form, &$form_state) {
   $embedding = ai_related_content_get_embedding($text, $config->get('index_id'));
 
   if (empty($embedding)) {
-    $results_html .= '<p style="color: red;"><strong>✗ Failed:</strong> No embedding was generated. Check watchdog logs for errors.</p>';
+    $results_html .= '<p style="color: var(--gin-color-danger, red);"><strong>✗ Failed:</strong> No embedding was generated. Check watchdog logs for errors.</p>';
   }
   elseif (!is_array($embedding)) {
-    $results_html .= '<p style="color: red;"><strong>✗ Failed:</strong> Embedding is not an array. Type: ' . gettype($embedding) . '</p>';
+    $results_html .= '<p style="color: var(--gin-color-danger, red);"><strong>✗ Failed:</strong> Embedding is not an array. Type: ' . gettype($embedding) . '</p>';
   }
   else {
-    $results_html .= '<p style="color: green;"><strong>✓ Success:</strong> Embedding generated with ' . count($embedding) . ' dimensions.</p>';
+    $results_html .= '<p style="color: var(--gin-color-green, green);"><strong>✓ Success:</strong> Embedding generated with ' . count($embedding) . ' dimensions.</p>';
     $results_html .= '<details><summary>First 10 values</summary><pre>' . check_plain(json_encode(array_slice($embedding, 0, 10))) . '</pre></details>';
   }
 
   // Step 3: Show vector search results
   $results_html .= '<h4>' . t('Step 3: Vector Search') . '</h4>';
   $results_html .= '<p>' . t('Requesting @limit related items...', ['@limit' => $limit]) . '</p>';
+  $weight = ai_related_content_popularity_weight();
+  $results_html .= '<p>' . ($weight > 0
+    ? t('Popularity blending on (weight @w): similarity and trending views are normalised within the candidate pool and combined.', ['@w' => $weight])
+    : t('Popularity blending off: ranked by similarity only.')) . '</p>';
 
   // Clear all match caches for this node first to ensure fresh results.
   cache_clear_all('ai_related_content_matches:' . $nid . ':', 'cache', TRUE);
@@ -1502,29 +1881,39 @@ function ai_related_content_test_form_submit($form, &$form_state) {
   $related = ai_related_content_get_related_matches($test_node, $limit);
 
   if (empty($related)) {
-    $results_html .= '<p><strong style="color: red;">' . t('✗ No related content found.') . '</strong></p>';
+    $results_html .= '<p><strong style="color: var(--gin-color-danger, red);">' . t('✗ No related content found.') . '</strong></p>';
     $results_html .= '<p>' . t('Possible causes:') . '</p>';
     $results_html .= '<ul>';
-    $results_html .= '<li>The vector database collection may be empty or not indexed</li>';
+    $results_html .= '<li>The vector database collection/table may be empty or not indexed</li>';
     $results_html .= '<li>The embedding dimensions may not match the indexed vectors</li>';
-    $results_html .= '<li>The collection name may be incorrect</li>';
-    $results_html .= '<li>Connection to Milvus/Pinecone may have failed</li>';
+    $results_html .= '<li>The collection name or table may be incorrect</li>';
+    $results_html .= '<li>Connection to vector backend (MariaDB Vector, pgvector, Milvus, Pinecone) may have failed</li>';
     $results_html .= '</ul>';
     $results_html .= '<p>' . t('Check the <a href="@url">watchdog logs</a> for detailed debug messages.', ['@url' => url('admin/reports/dblog', ['query' => ['type' => 'ai_related_content']])]) . '</p>';
   }
   else {
-    $results_html .= '<p><strong style="color: green;">' . t('✓ Found @count related items:', ['@count' => count($related)]) . '</strong></p>';
+    $results_html .= '<p><strong style="color: var(--gin-color-green, green);">' . t('✓ Found @count related items:', ['@count' => count($related)]) . '</strong></p>';
     $results_html .= '<ol>';
     foreach ($related as $match) {
       $rel_node = node_load($match['nid']);
       $title = $rel_node ? $rel_node->title : $match['title'];
       $status_icon = ($rel_node && $rel_node->status) ? '✓' : '✗';
-      $results_html .= '<li>' . $status_icon . ' ' . l($title, 'node/' . $match['nid']) . ' (nid: ' . $match['nid'] . ')';
+      $score_parts = [];
+      if (isset($match['score'])) {
+        $score_parts[] = 'score: ' . round((float) $match['score'], 4);
+      }
+      if (isset($match['blended'])) {
+        $score_parts[] = 'similarity: ' . round((float) $match['similarity'], 3);
+        $score_parts[] = 'trending views: ' . round((float) $match['popularity'], 1);
+        $score_parts[] = 'blended: ' . round((float) $match['blended'], 3);
+      }
+      $score_text = $score_parts ? ' <span style="color: var(--gin-color-text-light, #666); font-size: 0.9em;">(' . implode(', ', $score_parts) . ')</span>' : '';
+      $results_html .= '<li>' . $status_icon . ' ' . l($title, 'node/' . $match['nid']) . ' (nid: ' . $match['nid'] . ')' . $score_text;
       if (!$rel_node) {
-        $results_html .= ' <span style="color: red;">[Node not found]</span>';
+        $results_html .= ' <span style="color: var(--gin-color-danger, red);">[Node not found]</span>';
       }
       elseif (!$rel_node->status) {
-        $results_html .= ' <span style="color: orange;">[Unpublished]</span>';
+        $results_html .= ' <span style="color: var(--gin-color-warning, orange);">[Unpublished]</span>';
       }
       $results_html .= '</li>';
     }
@@ -1596,9 +1985,282 @@ function ai_related_content_node_update($node) {
 function ai_related_content_node_delete($node) {
   if (empty($node->nid)) return;
 
-  // Remove per-node exclusion entry if present.
+  // Remove per-node exclusion entry and view history if present.
   db_delete('ai_related_content_exclude')->condition('nid', (int) $node->nid)->execute();
+  db_delete('ai_related_content_views')->condition('nid', (int) $node->nid)->execute();
 
   // Invalidate caches that may reference the deleted node.
   ai_related_content_invalidate_caches();
+}
+
+
+/**
+ * Returns the cache expiry timestamp for related-content results.
+ *
+ * Similarity-only results change only when content changes (and node hooks
+ * clear the cache then), so they keep for a week. Popularity-blended results
+ * go stale as views accumulate, so they use the shorter configured lifetime.
+ */
+function ai_related_content_cache_expire() {
+  if (ai_related_content_popularity_weight() > 0) {
+    $ttl = (int) config_get('ai_related_content.settings', 'popularity_cache_ttl');
+    return REQUEST_TIME + max(60, $ttl ?: 3600);
+  }
+  return REQUEST_TIME + 604800;
+}
+
+/**
+ * Returns the effective popularity weight, clamped to 0..1.
+ *
+ * Returns 0 when blending is switched off, whatever the stored weight.
+ */
+function ai_related_content_popularity_weight() {
+  $config = config('ai_related_content.settings');
+  if (!$config->get('popularity_enabled')) {
+    return 0.0;
+  }
+  $weight = (float) $config->get('popularity_weight');
+  return max(0.0, min(1.0, $weight));
+}
+
+/**
+ * Returns the current day bucket (UTC days since the Unix epoch).
+ */
+function ai_related_content_popularity_day($timestamp = NULL) {
+  return (int) floor(($timestamp ?? REQUEST_TIME) / 86400);
+}
+
+/**
+ * Computes time-decayed trending scores for a set of nodes.
+ *
+ * Each day's hits are weighted by 0.5^(age / half_life), so a view from one
+ * half-life ago counts half as much as a view today.
+ *
+ * @param array $nids
+ *   Node IDs to score.
+ *
+ * @return array
+ *   Decayed view scores keyed by nid; nodes with no views score 0.
+ */
+function ai_related_content_popularity_scores(array $nids) {
+  $nids = array_values(array_unique(array_filter(array_map('intval', $nids))));
+  if (empty($nids)) {
+    return [];
+  }
+
+  $config = config('ai_related_content.settings');
+  $half_life = max(1, (int) ($config->get('popularity_half_life') ?: 7));
+  $window = max(1, (int) ($config->get('popularity_window') ?: 30));
+  $today = ai_related_content_popularity_day();
+
+  $scores = array_fill_keys($nids, 0.0);
+  try {
+    $result = db_select('ai_related_content_views', 'v')
+      ->fields('v', ['nid', 'day_bucket', 'hits'])
+      ->condition('nid', $nids, 'IN')
+      ->condition('day_bucket', $today - $window + 1, '>=')
+      ->execute();
+    foreach ($result as $row) {
+      $age = max(0, $today - (int) $row->day_bucket);
+      $scores[(int) $row->nid] += (int) $row->hits * pow(0.5, $age / $half_life);
+    }
+  }
+  catch (Exception $e) {
+    // Table missing (update.php not yet run): fall back to similarity only.
+    watchdog('ai_related_content', 'Popularity lookup failed: @msg', ['@msg' => $e->getMessage()], WATCHDOG_WARNING);
+  }
+
+  return $scores;
+}
+
+/**
+ * Re-ranks related candidates by blending similarity with popularity.
+ *
+ * Both signals are normalised to 0..1 within the candidate pool: similarity by
+ * min-max (direction taken from the backend's ordering, so distance metrics
+ * work too), popularity by log1p against the pool maximum so one viral page
+ * does not flatten everything else.
+ *
+ * @param array $items
+ *   Candidates in backend relevance order, each with 'nid' and optional
+ *   'score'.
+ * @param array $popularity
+ *   Trending scores keyed by nid.
+ * @param float $weight
+ *   0 = similarity only, 1 = popularity only.
+ *
+ * @return array
+ *   Items sorted by blended score, each gaining 'similarity', 'popularity'
+ *   and 'blended' keys. Ties keep the original relevance order.
+ */
+function ai_related_content_popularity_blend(array $items, array $popularity, $weight) {
+  $items = array_values($items);
+  $count = count($items);
+  if ($count === 0) {
+    return [];
+  }
+  $weight = max(0.0, min(1.0, (float) $weight));
+
+  // Similarity: min-max on raw scores when every item has one, else by rank.
+  $scores = array_column($items, 'score');
+  $use_scores = count($scores) === $count;
+  $min = $use_scores ? min($scores) : 0;
+  $range = $use_scores ? max($scores) - $min : 0;
+  // Backends return best match first; if scores ascend, they are distances.
+  $ascending = $use_scores && $count > 1 && $scores[0] < $scores[$count - 1];
+
+  $max_pop = 0.0;
+  foreach ($items as $item) {
+    $max_pop = max($max_pop, (float) ($popularity[$item['nid']] ?? 0));
+  }
+  $log_max = log1p($max_pop);
+
+  foreach ($items as $pos => &$item) {
+    if ($use_scores && $range > 0) {
+      $sim_norm = ((float) $item['score'] - $min) / $range;
+      if ($ascending) {
+        $sim_norm = 1 - $sim_norm;
+      }
+    }
+    elseif ($use_scores) {
+      $sim_norm = 1.0;
+    }
+    else {
+      $sim_norm = $count > 1 ? 1 - $pos / ($count - 1) : 1.0;
+    }
+    $pop = (float) ($popularity[$item['nid']] ?? 0);
+    $pop_norm = $log_max > 0 ? log1p($pop) / $log_max : 0.0;
+
+    $item['similarity'] = $sim_norm;
+    $item['popularity'] = $pop;
+    $item['blended'] = (1 - $weight) * $sim_norm + $weight * $pop_norm;
+    $item['_pos'] = $pos;
+  }
+  unset($item);
+
+  usort($items, function ($a, $b) {
+    if ($a['blended'] == $b['blended']) {
+      return $a['_pos'] <=> $b['_pos'];
+    }
+    return $b['blended'] <=> $a['blended'];
+  });
+
+  foreach ($items as &$item) {
+    unset($item['_pos']);
+  }
+  unset($item);
+
+  return $items;
+}
+
+/**
+ * Returns TRUE when a user agent looks like a bot, crawler or monitor.
+ */
+function ai_related_content_popularity_is_bot($user_agent) {
+  if (trim((string) $user_agent) === '') {
+    return TRUE;
+  }
+  return (bool) preg_match('/bot|crawl|spider|slurp|preview|facebookexternalhit|headless|lighthouse|pingdom|uptime|monitor|curl|wget|python|httpclient|java\/|go-http|scrapy/i', $user_agent);
+}
+
+/**
+ * Records one page view for a node.
+ *
+ * @param int $nid
+ *   The viewed node.
+ *
+ * @return bool
+ *   TRUE if the view was counted.
+ */
+function ai_related_content_popularity_record($nid) {
+  $nid = (int) $nid;
+  if ($nid <= 0) {
+    return FALSE;
+  }
+  $config = config('ai_related_content.settings');
+  if (!$config->get('popularity_tracking')) {
+    return FALSE;
+  }
+  if (ai_related_content_popularity_is_bot($_SERVER['HTTP_USER_AGENT'] ?? '')) {
+    return FALSE;
+  }
+  // Editors previewing their own work should not make it trend.
+  if (user_access('administer nodes')) {
+    return FALSE;
+  }
+
+  $flood_limit = (int) $config->get('popularity_flood_limit');
+  if ($flood_limit > 0) {
+    if (!flood_is_allowed('ai_related_content_hit', $flood_limit, 3600)) {
+      return FALSE;
+    }
+    flood_register_event('ai_related_content_hit', 3600);
+  }
+
+  // Only count published nodes, so the endpoint cannot be used to seed rows.
+  $status = db_query('SELECT status FROM {node} WHERE nid = :nid', [':nid' => $nid])->fetchField();
+  if (empty($status)) {
+    return FALSE;
+  }
+
+  // insertFields() must precede key(): it replaces the insert field list.
+  db_merge('ai_related_content_views')
+    ->insertFields(['hits' => 1])
+    ->key(['nid' => $nid, 'day_bucket' => ai_related_content_popularity_day()])
+    ->expression('hits', 'hits + 1')
+    ->execute();
+
+  return TRUE;
+}
+
+/**
+ * Page callback for the page-view beacon. Always answers 204.
+ */
+function ai_related_content_popularity_hit_callback() {
+  backdrop_page_is_cacheable(FALSE);
+  if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['nid'])) {
+    ai_related_content_popularity_record($_POST['nid']);
+  }
+  http_response_code(204);
+  header('Cache-Control: no-store');
+  backdrop_exit();
+}
+
+/**
+ * Implements hook_node_view().
+ *
+ * Attaches the page-view beacon to full node pages.
+ */
+function ai_related_content_node_view($node, $view_mode, $langcode) {
+  if ($view_mode !== 'full' || empty($node->nid) || !node_is_page($node)) {
+    return;
+  }
+  if (!config_get('ai_related_content.settings', 'popularity_tracking')) {
+    return;
+  }
+  $node->content['#attached']['js'][] = backdrop_get_path('module', 'ai_related_content') . '/js/ai_related_content.tracker.js';
+  $node->content['#attached']['js'][] = [
+    'type' => 'setting',
+    'data' => [
+      'aiRelatedContentTracker' => [
+        'nid' => (int) $node->nid,
+        'url' => url('ai-related-content/hit'),
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Prunes page-view history older than the configured window.
+ */
+function ai_related_content_cron() {
+  $window = max(1, (int) (config_get('ai_related_content.settings', 'popularity_window') ?: 30));
+  if (!db_table_exists('ai_related_content_views')) {
+    return;
+  }
+  db_delete('ai_related_content_views')
+    ->condition('day_bucket', ai_related_content_popularity_day() - $window + 1, '<')
+    ->execute();
 }
