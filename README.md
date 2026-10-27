@@ -48,7 +48,7 @@ Bugs and feature requests should be reported in the
 ## Credits
 
 - Created for Backdrop CMS by [Justin Keiser](https://github.com/keiserjb)
-- Inspired by the Drupal module of the same name.
+- Inspired by the Drupal [AI Related Content](https://www.drupal.org/project/ai_related_content) module.
 - Developed with AI assistance.
 
 ## License
